@@ -1,9 +1,8 @@
 require "dependency"
 require "dependencies"
-require "ld64_dependency"
 require "requirement"
 require "requirements"
-require "set"
+require "extend/cachable"
 
 ## A dependency is a formula that another formula needs to install.
 ## A requirement is something other than a formula that another formula
@@ -16,16 +15,7 @@ require "set"
 # This class is used by `depends_on` in the formula DSL to turn dependency
 # specifications into the proper kinds of dependencies and requirements.
 class DependencyCollector
-  # Define the languages that we can handle as external dependencies.
-  LANGUAGE_MODULES = Set[
-    :chicken, :jruby, :lua, :node, :ocaml, :perl, :python, :python3, :rbx, :ruby
-  ].freeze
-
-  CACHE = {}
-
-  def self.clear_cache
-    CACHE.clear
-  end
+  extend Cachable
 
   attr_reader :deps, :requirements
 
@@ -45,11 +35,11 @@ class DependencyCollector
   end
 
   def fetch(spec)
-    CACHE.fetch(cache_key(spec)) { |key| CACHE[key] = build(spec) }
+    self.class.cache.fetch(cache_key(spec)) { |key| self.class.cache[key] = build(spec) }
   end
 
   def cache_key(spec)
-    if Resource === spec && spec.download_strategy == CurlDownloadStrategy
+    if spec.is_a?(Resource) && spec.download_strategy == CurlDownloadStrategy
       File.extname(spec.url)
     else
       spec
@@ -57,8 +47,40 @@ class DependencyCollector
   end
 
   def build(spec)
-    spec, tags = Hash === spec ? spec.first : spec
+    spec, tags = spec.is_a?(Hash) ? spec.first : spec
     parse_spec(spec, Array(tags))
+  end
+
+  def git_dep_if_needed(tags)
+    return if Utils.git_available?
+    Dependency.new("git", tags)
+  end
+
+  def subversion_dep_if_needed(tags)
+    return if Utils.svn_available?
+    Dependency.new("subversion", tags)
+  end
+
+  def cvs_dep_if_needed(tags)
+    Dependency.new("cvs", tags) unless which("cvs")
+  end
+
+  def xz_dep_if_needed(tags)
+    Dependency.new("xz", tags) unless which("xz")
+  end
+
+  def unzip_dep_if_needed(tags)
+    Dependency.new("unzip", tags) unless which("unzip")
+  end
+
+  def bzip2_dep_if_needed(tags)
+    Dependency.new("bzip2", tags) unless which("bzip2")
+  end
+
+  def ld64_dep_if_needed(*); end
+
+  def self.tar_needs_xz_dependency?
+    !new.xz_dep_if_needed([]).nil?
   end
 
   private
@@ -81,12 +103,10 @@ class DependencyCollector
   end
 
   def parse_string_spec(spec, tags)
-    if HOMEBREW_TAP_FORMULA_REGEX === spec
+    if spec =~ HOMEBREW_TAP_FORMULA_REGEX
       TapDependency.new(spec, tags)
     elsif tags.empty?
       Dependency.new(spec, tags)
-    elsif (tag = tags.first) && LANGUAGE_MODULES.include?(tag)
-      LanguageModuleRequirement.new(tag, spec, tags[1])
     else
       Dependency.new(spec, tags)
     end
@@ -96,78 +116,45 @@ class DependencyCollector
     case spec
     when :x11        then X11Requirement.new(spec.to_s, tags)
     when :xcode      then XcodeRequirement.new(tags)
-    when :macos      then MinimumMacOSRequirement.new(tags)
-    when :mysql      then MysqlRequirement.new(tags)
-    when :postgresql then PostgresqlRequirement.new(tags)
-    when :gpg        then GPGRequirement.new(tags)
-    when :fortran    then FortranRequirement.new(tags)
-    when :mpi        then MPIRequirement.new(*tags)
-    when :tex        then TeXRequirement.new(tags)
+    when :linux      then LinuxRequirement.new(tags)
+    when :macos      then MacOSRequirement.new(tags)
     when :arch       then ArchRequirement.new(tags)
-    when :hg         then MercurialRequirement.new(tags)
-    when :python     then PythonRequirement.new(tags)
-    when :python3    then Python3Requirement.new(tags)
     when :java       then JavaRequirement.new(tags)
-    when :ruby       then RubyRequirement.new(tags)
     when :osxfuse    then OsxfuseRequirement.new(tags)
     when :tuntap     then TuntapRequirement.new(tags)
-    when :ant        then ant_dep(spec, tags)
-    when :apr        then AprRequirement.new(tags)
-    when :emacs      then EmacsRequirement.new(tags)
-    # Tiger's ld is too old to properly link some software
-    when :ld64       then LD64Dependency.new if MacOS.version < :leopard
-    when :clt # deprecated
-    when :autoconf, :automake, :bsdmake, :libtool # deprecated
-      autotools_dep(spec, tags)
-    when :cairo, :fontconfig, :freetype, :libpng, :pixman # deprecated
-      Dependency.new(spec.to_s, tags)
-    when :libltdl # deprecated
-      tags << :run
-      Dependency.new("libtool", tags)
-    when :python2
-      PythonRequirement.new(tags)
+    when :ld64       then ld64_dep_if_needed(tags)
     else
       raise ArgumentError, "Unsupported special dependency #{spec.inspect}"
     end
   end
 
   def parse_class_spec(spec, tags)
-    if spec < Requirement
-      spec.new(tags)
-    else
+    unless spec < Requirement
       raise TypeError, "#{spec.inspect} is not a Requirement subclass"
     end
-  end
 
-  def autotools_dep(spec, tags)
-    tags << :build unless tags.include? :run
-    Dependency.new(spec.to_s, tags)
-  end
-
-  def ant_dep(spec, tags)
-    if MacOS.version >= :mavericks
-      Dependency.new(spec.to_s, tags)
-    end
+    spec.new(tags)
   end
 
   def resource_dep(spec, tags)
     tags << :build
     strategy = spec.download_strategy
 
-    case
-    when strategy <= CurlDownloadStrategy
+    if strategy <= CurlDownloadStrategy
       parse_url_spec(spec.url, tags)
-    when strategy <= GitDownloadStrategy
-      GitRequirement.new(tags)
-    when strategy <= MercurialDownloadStrategy
-      MercurialRequirement.new(tags)
-    when strategy <= FossilDownloadStrategy
+    elsif strategy <= GitDownloadStrategy
+      git_dep_if_needed(tags)
+    elsif strategy <= SubversionDownloadStrategy
+      subversion_dep_if_needed(tags)
+    elsif strategy <= MercurialDownloadStrategy
+      Dependency.new("mercurial", tags)
+    elsif strategy <= FossilDownloadStrategy
       Dependency.new("fossil", tags)
-    when strategy <= BazaarDownloadStrategy
+    elsif strategy <= BazaarDownloadStrategy
       Dependency.new("bazaar", tags)
-    when strategy <= CVSDownloadStrategy
-      Dependency.new("cvs", tags) if MacOS.version >= :mavericks || !MacOS::Xcode.provides_cvs?
-    when strategy < AbstractDownloadStrategy
+    elsif strategy <= CVSDownloadStrategy
+      cvs_dep_if_needed(tags)
+    elsif strategy < AbstractDownloadStrategy
       # allow unknown strategies to pass through
     else
       raise TypeError,
@@ -177,10 +164,15 @@ class DependencyCollector
 
   def parse_url_spec(url, tags)
     case File.extname(url)
-    when ".xz"  then Dependency.new("xz", tags)
-    when ".lz"  then Dependency.new("lzip", tags)
-    when ".rar" then Dependency.new("unrar", tags)
-    when ".7z"  then Dependency.new("p7zip", tags)
+    when ".xz"          then xz_dep_if_needed(tags)
+    when ".zip"         then unzip_dep_if_needed(tags)
+    when ".bz2"         then bzip2_dep_if_needed(tags)
+    when ".lha", ".lzh" then Dependency.new("lha", tags)
+    when ".lz"          then Dependency.new("lzip", tags)
+    when ".rar"         then Dependency.new("unrar", tags)
+    when ".7z"          then Dependency.new("p7zip", tags)
     end
   end
 end
+
+require "extend/os/dependency_collector"

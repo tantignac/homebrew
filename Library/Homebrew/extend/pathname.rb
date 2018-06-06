@@ -1,12 +1,65 @@
-require "pathname"
-require "mach"
 require "resource"
 require "metafiles"
 
+module DiskUsageExtension
+  def disk_usage
+    return @disk_usage if @disk_usage
+    compute_disk_usage
+    @disk_usage
+  end
+
+  def file_count
+    return @file_count if @file_count
+    compute_disk_usage
+    @file_count
+  end
+
+  def abv
+    out = ""
+    compute_disk_usage
+    out << "#{number_readable(@file_count)} files, " if @file_count > 1
+    out << disk_usage_readable(@disk_usage).to_s
+  end
+
+  private
+
+  def compute_disk_usage
+    path = if symlink?
+      resolved_path
+    else
+      self
+    end
+
+    if path.directory?
+      scanned_files = Set.new
+      @file_count = 0
+      @disk_usage = 0
+      path.find do |f|
+        if f.directory?
+          @disk_usage += f.lstat.size
+        else
+          @file_count += 1 if f.basename.to_s != ".DS_Store"
+          # use Pathname#lstat instead of Pathname#stat to get info of symlink itself.
+          stat = f.lstat
+          file_id = [stat.dev, stat.ino]
+          # count hardlinks only once.
+          unless scanned_files.include?(file_id)
+            @disk_usage += stat.size
+            scanned_files.add(file_id)
+          end
+        end
+      end
+    else
+      @file_count = 1
+      @disk_usage = path.lstat.size
+    end
+  end
+end
+
 # Homebrew extends Ruby's `Pathname` to make our code more readable.
-# @see http://ruby-doc.org/stdlib-1.8.7/libdoc/pathname/rdoc/Pathname.html  Ruby's Pathname API
+# @see https://ruby-doc.org/stdlib-1.8.7/libdoc/pathname/rdoc/Pathname.html  Ruby's Pathname API
 class Pathname
-  include MachO
+  include DiskUsageExtension
 
   # @private
   BOTTLE_EXTNAME_RX = /(\.[a-z0-9_]+\.bottle\.(\d+\.)?tar\.gz)$/
@@ -22,13 +75,13 @@ class Pathname
       when Array
         if src.empty?
           opoo "tried to install empty array to #{self}"
-          return
+          break
         end
         src.each { |s| install_p(s, File.basename(s)) }
       when Hash
         if src.empty?
           opoo "tried to install empty hash to #{self}"
-          return
+          break
         end
         src.each { |s, new_basename| install_p(s, new_basename) }
       else
@@ -43,6 +96,7 @@ class Pathname
     src = Pathname(src)
     dst = join(new_basename)
     dst = yield(src, dst) if block_given?
+    return unless dst
 
     mkpath
 
@@ -82,7 +136,7 @@ class Pathname
 
   if method_defined?(:write)
     # @private
-    alias_method :old_write, :write
+    alias old_write write
   end
 
   # we assume this pathname object is a file obviously
@@ -92,13 +146,23 @@ class Pathname
     open("w", *open_args) { |f| f.write(content) }
   end
 
-  def binwrite(contents, *open_args)
-    open("wb", *open_args) { |f| f.write(contents) }
-  end unless method_defined?(:binwrite)
+  # Only appends to a file that is already created.
+  def append_lines(content, *open_args)
+    raise "Cannot append file that doesn't exist: #{self}" unless exist?
+    open("a", *open_args) { |f| f.puts(content) }
+  end
 
-  def binread(*open_args)
-    open("rb", *open_args) { |f| f.read }
-  end unless method_defined?(:binread)
+  unless method_defined?(:binwrite)
+    def binwrite(contents, *open_args)
+      open("wb", *open_args) { |f| f.write(contents) }
+    end
+  end
+
+  unless method_defined?(:binread)
+    def binread(*open_args)
+      open("rb", *open_args, &:read)
+    end
+  end
 
   # NOTE always overwrites
   def atomic_write(content)
@@ -120,9 +184,12 @@ class Pathname
       begin
         tf.chown(uid, gid)
         tf.chmod(old_stat.mode)
-      rescue Errno::EPERM
+      rescue Errno::EPERM # rubocop:disable Lint/HandleExceptions
       end
 
+      # Close the file before renaming to prevent the error: Device or resource busy
+      # Affects primarily NFS.
+      tf.close
       File.rename(tf.path, self)
     ensure
       tf.close!
@@ -139,19 +206,8 @@ class Pathname
   private :default_stat
 
   # @private
-  def cp(dst)
-    opoo "Pathname#cp is deprecated, use FileUtils.cp"
-    if file?
-      FileUtils.cp to_s, dst
-    else
-      FileUtils.cp_r to_s, dst
-    end
-    dst
-  end
-
-  # @private
   def cp_path_sub(pattern, replacement)
-    raise "#{self} does not exist" unless self.exist?
+    raise "#{self} does not exist" unless exist?
 
     dst = sub(pattern, replacement)
 
@@ -167,14 +223,14 @@ class Pathname
   end
 
   # @private
-  alias_method :extname_old, :extname
+  alias extname_old extname
 
   # extended to support common double extensions
   def extname(path = to_s)
-    BOTTLE_EXTNAME_RX.match(path)
-    return $1 if $1
-    /(\.(tar|cpio|pax)\.(gz|bz2|lz|xz|Z))$/.match(path)
-    return $1 if $1
+    bottle_ext = path[BOTTLE_EXTNAME_RX, 1]
+    return bottle_ext if bottle_ext
+    archive_ext = path[/(\.(tar|cpio|pax)\.(gz|bz2|lz|xz|Z))$/, 1]
+    return archive_ext if archive_ext
     File.extname(path)
   end
 
@@ -191,27 +247,20 @@ class Pathname
     rmdir
     true
   rescue Errno::ENOTEMPTY
-    if (ds_store = self+".DS_Store").exist? && children.length == 1
+    if (ds_store = join(".DS_Store")).exist? && children.length == 1
       ds_store.unlink
       retry
     else
       false
     end
-  rescue Errno::EACCES, Errno::ENOENT
+  rescue Errno::EACCES, Errno::ENOENT, Errno::EBUSY
     false
-  end
-
-  # @private
-  def chmod_R(perms)
-    opoo "Pathname#chmod_R is deprecated, use FileUtils.chmod_R"
-    require "fileutils"
-    FileUtils.chmod_R perms, to_s
   end
 
   # @private
   def version
     require "version"
-    Version.parse(self)
+    Version.parse(basename)
   end
 
   # @private
@@ -257,7 +306,7 @@ class Pathname
 
   # @private
   def text_executable?
-    /^#!\s*\S+/ === open("r") { |f| f.read(1024) }
+    /^#!\s*\S+/ =~ open("r") { |f| f.read(1024) }
   end
 
   # @private
@@ -272,15 +321,9 @@ class Pathname
     digest.hexdigest
   end
 
-  # @private
-  def sha1
-    require "digest/sha1"
-    incremental_hash(Digest::SHA1)
-  end
-
   def sha256
     require "digest/sha2"
-    incremental_hash(Digest::SHA2)
+    incremental_hash(Digest::SHA256)
   end
 
   def verify_checksum(expected)
@@ -289,11 +332,10 @@ class Pathname
     raise ChecksumMismatchError.new(self, expected, actual) unless expected == actual
   end
 
-  # FIXME: eliminate the places where we rely on this method
-  alias_method :to_str, :to_s unless method_defined?(:to_str)
+  alias to_str to_s unless method_defined?(:to_str)
 
   def cd
-    Dir.chdir(self) { yield }
+    Dir.chdir(self) { yield self }
   end
 
   def subdirs
@@ -302,7 +344,7 @@ class Pathname
 
   # @private
   def resolved_path
-    self.symlink? ? dirname+readlink : self
+    symlink? ? dirname.join(readlink) : self
   end
 
   # @private
@@ -312,7 +354,7 @@ class Pathname
     # The link target contains NUL bytes
     false
   else
-    (dirname+link).exist?
+    dirname.join(link).exist?
   end
 
   # @private
@@ -321,20 +363,21 @@ class Pathname
     File.symlink(src.relative_path_from(dirname), self)
   end
 
-  def /(other)
-    unless other.respond_to?(:to_str) || other.respond_to?(:to_path)
-      opoo "Pathname#/ called on #{inspect} with #{other.inspect} as an argument"
-      puts "This behavior is deprecated, please pass either a String or a Pathname"
+  unless method_defined?(:/)
+    def /(other)
+      if !other.respond_to?(:to_str) && !other.respond_to?(:to_path)
+        odisabled "Pathname#/ with #{other.class}", "a String or a Pathname"
+      end
+      join(other.to_s)
     end
-    self + other.to_s
-  end unless method_defined?(:/)
+  end
 
   # @private
   def ensure_writable
     saved_perms = nil
     unless writable_real?
       saved_perms = stat.mode
-      chmod 0644
+      FileUtils.chmod "u+rw", to_path
     end
     yield
   ensure
@@ -361,7 +404,7 @@ class Pathname
     mkpath
     targets.each do |target|
       target = Pathname.new(target) # allow pathnames or strings
-      (self+target.basename).write <<-EOS.undent
+      join(target.basename).write <<~EOS
         #!/bin/bash
         exec "#{target}" "$@"
       EOS
@@ -373,9 +416,9 @@ class Pathname
     env_export = ""
     env.each { |key, value| env_export += "#{key}=\"#{value}\" " }
     dirname.mkpath
-    write <<-EOS.undent
-    #!/bin/bash
-    #{env_export}exec "#{target}" "$@"
+    write <<~EOS
+      #!/bin/bash
+      #{env_export}exec "#{target}" "$@"
     EOS
   end
 
@@ -385,17 +428,20 @@ class Pathname
     Pathname.glob("#{self}/*") do |file|
       next if file.directory?
       dst.install(file)
-      new_file = dst+file.basename
+      new_file = dst.join(file.basename)
       file.write_env_script(new_file, env)
     end
   end
 
   # Writes an exec script that invokes a java jar
-  def write_jar_script(target_jar, script_name, java_opts = "")
+  def write_jar_script(target_jar, script_name, java_opts = "", java_version: nil)
     mkpath
-    (self+script_name).write <<-EOS.undent
+    java_home = if java_version
+      "JAVA_HOME=\"$(#{Language::Java.java_home_cmd(java_version)})\" "
+    end
+    join(script_name).write <<~EOS
       #!/bin/bash
-      exec java #{java_opts} -jar #{target_jar} "$@"
+      #{java_home}exec java #{java_opts} -jar #{target_jar} "$@"
     EOS
   end
 
@@ -413,58 +459,33 @@ class Pathname
     end
   end
 
-  # @private
-  def abv
-    out = ""
-    n = Utils.popen_read("find", expand_path.to_s, "-type", "f", "!", "-name", ".DS_Store").split("\n").size
-    out << "#{n} files, " if n > 1
-    size = Utils.popen_read("/usr/bin/du", "-hs", expand_path.to_s).split("\t")[0]
-    size ||= "0B"
-    out << size.strip
-    out
+  def ds_store?
+    basename.to_s == ".DS_Store"
   end
 
-  # We redefine these private methods in order to add the /o modifier to
-  # the Regexp literals, which forces string interpolation to happen only
-  # once instead of each time the method is called. This is fixed in 1.9+.
-  if RUBY_VERSION <= "1.8.7"
-    # @private
-    alias_method :old_chop_basename, :chop_basename
-
-    def chop_basename(path)
-      base = File.basename(path)
-      if /\A#{Pathname::SEPARATOR_PAT}?\z/o =~ base
-        return nil
-      else
-        return path[0, path.rindex(base)], base
-      end
-    end
-    private :chop_basename
-
-    # @private
-    alias_method :old_prepend_prefix, :prepend_prefix
-
-    def prepend_prefix(prefix, relpath)
-      if relpath.empty?
-        File.dirname(prefix)
-      elsif /#{SEPARATOR_PAT}/o =~ prefix
-        prefix = File.dirname(prefix)
-        prefix = File.join(prefix, "") if File.basename(prefix + "a") != "a"
-        prefix + relpath
-      else
-        prefix + relpath
-      end
-    end
-    private :prepend_prefix
-  elsif RUBY_VERSION == "2.0.0"
-    # https://bugs.ruby-lang.org/issues/9915
+  # https://bugs.ruby-lang.org/issues/9915
+  if RUBY_VERSION == "2.0.0"
     prepend Module.new {
       def inspect
         super.force_encoding(@path.encoding)
       end
     }
   end
+
+  def binary_executable?
+    false
+  end
+
+  def mach_o_bundle?
+    false
+  end
+
+  def dylib?
+    false
+  end
 end
+
+require "extend/os/pathname"
 
 # @private
 module ObserverPathnameExtension
@@ -473,6 +494,7 @@ module ObserverPathnameExtension
 
     def reset_counts!
       @n = @d = 0
+      @put_verbose_trimmed_warning = false
     end
 
     def total
@@ -482,33 +504,55 @@ module ObserverPathnameExtension
     def counts
       [n, d]
     end
+
+    MAXIMUM_VERBOSE_OUTPUT = 100
+
+    def verbose?
+      return ARGV.verbose? unless ENV["CI"]
+      return false unless ARGV.verbose?
+
+      if total < MAXIMUM_VERBOSE_OUTPUT
+        true
+      else
+        unless @put_verbose_trimmed_warning
+          puts "Only the first #{MAXIMUM_VERBOSE_OUTPUT} operations were output."
+          @put_verbose_trimmed_warning = true
+        end
+        false
+      end
+    end
   end
 
   def unlink
     super
-    puts "rm #{self}" if ARGV.verbose?
+    puts "rm #{self}" if ObserverPathnameExtension.verbose?
     ObserverPathnameExtension.n += 1
+  end
+
+  def mkpath
+    super
+    puts "mkdir -p #{self}" if ObserverPathnameExtension.verbose?
   end
 
   def rmdir
     super
-    puts "rmdir #{self}" if ARGV.verbose?
+    puts "rmdir #{self}" if ObserverPathnameExtension.verbose?
     ObserverPathnameExtension.d += 1
   end
 
   def make_relative_symlink(src)
     super
-    puts "ln -s #{src.relative_path_from(dirname)} #{basename}" if ARGV.verbose?
+    puts "ln -s #{src.relative_path_from(dirname)} #{basename}" if ObserverPathnameExtension.verbose?
     ObserverPathnameExtension.n += 1
   end
 
   def install_info
     super
-    puts "info #{self}" if ARGV.verbose?
+    puts "info #{self}" if ObserverPathnameExtension.verbose?
   end
 
   def uninstall_info
     super
-    puts "uninfo #{self}" if ARGV.verbose?
+    puts "uninfo #{self}" if ObserverPathnameExtension.verbose?
   end
 end

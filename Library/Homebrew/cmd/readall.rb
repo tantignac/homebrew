@@ -1,64 +1,35 @@
-# `brew readall` tries to import all formulae one-by-one.
-# This can be useful for debugging issues across all formulae
-# when making significant changes to formula.rb,
-# or to determine if any current formulae have Ruby issues
+#:  * `readall` [`--aliases`] [`--syntax`] [<taps>]:
+#:    Import all formulae from specified <taps> (defaults to all installed taps).
+#:
+#:    This can be useful for debugging issues across all formulae when making
+#:    significant changes to `formula.rb`, testing the performance of loading
+#:    all formulae or to determine if any current formulae have Ruby issues.
+#:
+#:    If `--aliases` is passed, also verify any alias symlinks in each tap.
+#:
+#:    If `--syntax` is passed, also syntax-check all of Homebrew's Ruby files.
 
-require "formula"
-require "cmd/tap"
-require "thread"
+require "readall"
 
 module Homebrew
+  module_function
+
   def readall
-    if ARGV.delete("--syntax")
-      ruby_files = Queue.new
-      Dir.glob("#{HOMEBREW_LIBRARY}/Homebrew/**/*.rb").each do |rb|
-        next if rb.include?("/vendor/")
-        ruby_files << rb
-      end
+    if ARGV.include?("--syntax")
+      scan_files = "#{HOMEBREW_LIBRARY_PATH}/**/*.rb"
+      ruby_files = Dir.glob(scan_files).reject { |file| file =~ %r{/(vendor|cask)/} }
 
-      failed = false
-      nostdout do
-        workers = (0...Hardware::CPU.cores).map do
-          Thread.new do
-            begin
-              while rb = ruby_files.pop(true)
-                failed = true unless system RUBY_PATH, "-c", "-w", rb
-              end
-            rescue ThreadError # ignore empty queue error
-            end
-          end
-        end
-        workers.map(&:join)
-      end
-      Homebrew.failed = failed
+      Homebrew.failed = true unless Readall.valid_ruby_syntax?(ruby_files)
     end
 
-    if ARGV.delete("--aliases")
-      Pathname.glob("#{HOMEBREW_LIBRARY}/Aliases/*").each do |f|
-        next unless f.symlink?
-        next if f.file?
-        onoe "Broken alias: #{f}"
-        Homebrew.failed = true
-      end
-    end
-
-    formulae = []
-    if ARGV.named.empty?
-      formulae = Formula.files
+    options = { aliases: ARGV.include?("--aliases") }
+    taps = if ARGV.named.empty?
+      Tap
     else
-      tap = Tap.new(*tap_args)
-      raise TapUnavailableError, tap.name unless tap.installed?
-      formulae = tap.formula_files
+      ARGV.named.map { |t| Tap.fetch(t) }
     end
-
-    formulae.each do |file|
-      begin
-        Formulary.factory(file)
-      rescue Exception => e
-        onoe "problem in #{file}"
-        puts e
-        Homebrew.failed = true
-      end
+    taps.each do |tap|
+      Homebrew.failed = true unless Readall.valid_tap?(tap, options)
     end
   end
 end

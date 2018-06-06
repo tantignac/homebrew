@@ -1,47 +1,43 @@
+#:  * `--env` [`--shell=`(<shell>|`auto`)|`--plain`]:
+#:    Show a summary of the Homebrew build environment as a plain list.
+#:
+#:    Pass `--shell=`<shell> to generate a list of environment variables for the
+#:    specified shell, or `--shell=auto` to detect the current shell.
+#:
+#:    If the command's output is sent through a pipe and no shell is specified,
+#:    the list is formatted for export to `bash`(1) unless `--plain` is passed.
+
 require "extend/ENV"
+require "build_environment"
+require "utils/shell"
 
 module Homebrew
+  module_function
+
   def __env
     ENV.activate_extensions!
     ENV.deps = ARGV.formulae if superenv?
     ENV.setup_build_environment
     ENV.universal_binary if ARGV.build_universal?
 
-    if $stdout.tty?
+    shell_value = ARGV.value("shell")
+
+    if ARGV.include?("--plain")
+      shell = nil
+    elsif shell_value.nil?
+      # legacy behavior
+      shell = :bash unless $stdout.tty?
+    elsif shell_value == "auto"
+      shell = Utils::Shell.parent || Utils::Shell.preferred
+    elsif shell_value
+      shell = Utils::Shell.from_path(shell_value)
+    end
+
+    env_keys = build_env_keys(ENV)
+    if shell.nil?
       dump_build_env ENV
     else
-      build_env_keys(ENV).each do |key|
-        puts "export #{key}=\"#{ENV[key]}\""
-      end
-    end
-  end
-
-  def build_env_keys(env)
-    %w[
-      CC CXX LD OBJC OBJCXX
-      HOMEBREW_CC HOMEBREW_CXX
-      CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT MAKEFLAGS
-      CMAKE_PREFIX_PATH CMAKE_INCLUDE_PATH CMAKE_LIBRARY_PATH CMAKE_FRAMEWORK_PATH
-      MACOSX_DEPLOYMENT_TARGET PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
-      HOMEBREW_DEBUG HOMEBREW_MAKE_JOBS HOMEBREW_VERBOSE
-      HOMEBREW_SVN HOMEBREW_GIT
-      HOMEBREW_SDKROOT HOMEBREW_BUILD_FROM_SOURCE
-      MAKE GIT CPP
-      ACLOCAL_PATH PATH CPATH].select { |key| env.key?(key) }
-  end
-
-  def dump_build_env(env, f = $stdout)
-    keys = build_env_keys(env)
-    keys -= %w[CC CXX OBJC OBJCXX] if env["CC"] == env["HOMEBREW_CC"]
-
-    keys.each do |key|
-      value = env[key]
-      s = "#{key}: #{value}"
-      case key
-      when "CC", "CXX", "LD"
-        s << " => #{Pathname.new(value).realpath}" if File.symlink?(value)
-      end
-      f.puts s
+      env_keys.each { |key| puts Utils::Shell.export_value(shell, key, ENV[key]) }
     end
   end
 end

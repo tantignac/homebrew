@@ -1,4 +1,3 @@
-require "set"
 
 class Option
   attr_reader :name, :description, :flag
@@ -14,14 +13,14 @@ class Option
   end
 
   def <=>(other)
-    return unless Option === other
+    return unless other.is_a?(Option)
     name <=> other.name
   end
 
   def ==(other)
     instance_of?(other.class) && name == other.name
   end
-  alias_method :eql?, :==
+  alias eql? ==
 
   def hash
     name.hash
@@ -51,7 +50,7 @@ class DeprecatedOption
   def ==(other)
     instance_of?(other.class) && old == other.old && current == other.current
   end
-  alias_method :eql?, :==
+  alias eql? ==
 end
 
 class Options
@@ -69,29 +68,29 @@ class Options
     @options.each(*args, &block)
   end
 
-  def <<(o)
-    @options << o
+  def <<(other)
+    @options << other
     self
   end
 
-  def +(o)
-    self.class.new(@options + o)
+  def +(other)
+    self.class.new(@options + other)
   end
 
-  def -(o)
-    self.class.new(@options - o)
+  def -(other)
+    self.class.new(@options - other)
   end
 
-  def &(o)
-    self.class.new(@options & o)
+  def &(other)
+    self.class.new(@options & other)
   end
 
-  def |(o)
-    self.class.new(@options | o)
+  def |(other)
+    self.class.new(@options | other)
   end
 
-  def *(arg)
-    @options.to_a * arg
+  def *(other)
+    @options.to_a * other
   end
 
   def empty?
@@ -106,9 +105,21 @@ class Options
     any? { |opt| opt == o || opt.name == o || opt.flag == o }
   end
 
-  alias_method :to_ary, :to_a
+  alias to_ary to_a
 
   def inspect
     "#<#{self.class.name}: #{to_a.inspect}>"
+  end
+end
+
+module Homebrew
+  module_function
+
+  def dump_options_for_formula(f)
+    f.options.sort_by(&:flag).each do |opt|
+      puts "#{opt.flag}\n\t#{opt.description}"
+    end
+    puts "--devel\n\tInstall development version #{f.devel.version}" if f.devel
+    puts "--HEAD\n\tInstall HEAD version" if f.head
   end
 end

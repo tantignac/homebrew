@@ -1,6 +1,18 @@
+#:  * `diy` [`--name=`<name>] [`--version=`<version>]:
+#:    Automatically determine the installation prefix for non-Homebrew software.
+#:
+#:    Using the output from this command, you can install your own software into
+#:    the Cellar and then link it into Homebrew's prefix with `brew link`.
+#:
+#:    The options `--name=`<name> and `--version=`<version> each take an argument
+#:    and allow you to explicitly set the name and version of the package you are
+#:    installing.
+
 require "formula"
 
 module Homebrew
+  module_function
+
   def diy
     path = Pathname.getwd
 
@@ -21,11 +33,9 @@ module Homebrew
   def detect_version(path)
     version = path.version.to_s
 
-    if version.empty?
-      raise "Couldn't determine version, set it with --version=<version>"
-    else
-      version
-    end
+    raise "Couldn't determine version, set it with --version=<version>" if version.empty?
+
+    version
   end
 
   def detect_name(path, version)
@@ -33,7 +43,7 @@ module Homebrew
     detected_name = basename[/(.*?)-?#{Regexp.escape(version)}/, 1] || basename
     canonical_name = Formulary.canonical_name(detected_name)
 
-    odie <<-EOS.undent if detected_name != canonical_name
+    odie <<~EOS if detected_name != canonical_name
       The detected name #{detected_name.inspect} exists in Homebrew as an alias
       of #{canonical_name.inspect}. Consider using the canonical name instead:
         brew diy --name=#{canonical_name}

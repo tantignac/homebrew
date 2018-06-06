@@ -1,11 +1,24 @@
+#:  * `options` [`--compact`] (`--all`|`--installed`|<formulae>):
+#:    Display install options specific to <formulae>.
+#:
+#:    If `--compact` is passed, show all options on a single line separated by
+#:    spaces.
+#:
+#:    If `--all` is passed, show options for all formulae.
+#:
+#:    If `--installed` is passed, show options for all installed formulae.
+
 require "formula"
+require "options"
 
 module Homebrew
+  module_function
+
   def options
     if ARGV.include? "--all"
-      puts_options Formula.to_a
+      puts_options Formula.to_a.sort
     elsif ARGV.include? "--installed"
-      puts_options Formula.installed
+      puts_options Formula.installed.sort
     else
       raise FormulaUnspecifiedError if ARGV.named.empty?
       puts_options ARGV.formulae
@@ -23,13 +36,5 @@ module Homebrew
         puts
       end
     end
-  end
-
-  def dump_options_for_formula(f)
-    f.options.sort_by(&:flag).each do |opt|
-      puts "#{opt.flag}\n\t#{opt.description}"
-    end
-    puts "--devel\n\tInstall development version #{f.devel.version}" if f.devel
-    puts "--HEAD\n\tInstall HEAD version" if f.head
   end
 end

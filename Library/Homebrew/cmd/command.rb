@@ -1,16 +1,23 @@
-module Homebrew
-  def command
-    cmd = ARGV.first
-    cmd = HOMEBREW_INTERNAL_COMMAND_ALIASES.fetch(cmd, cmd)
+#:  * `command` <cmd>:
+#:    Display the path to the file which is used when invoking `brew` <cmd>.
 
-    if (path = HOMEBREW_LIBRARY_PATH/"cmd/#{cmd}.rb").file?
-      puts path
-    elsif ARGV.homebrew_developer? && (path = HOMEBREW_LIBRARY_PATH/"dev-cmd/#{cmd}.rb").file?
-      puts path
-    elsif (path = which("brew-#{cmd}") || which("brew-#{cmd}.rb"))
-      puts path
-    else
-      odie "Unknown command: #{cmd}"
-    end
+require "commands"
+
+module Homebrew
+  module_function
+
+  def command
+    abort "This command requires a command argument" if ARGV.empty?
+
+    cmd = HOMEBREW_INTERNAL_COMMAND_ALIASES.fetch(ARGV.first, ARGV.first)
+
+    path = Commands.path(cmd)
+
+    cmd_paths = PATH.new(ENV["PATH"]).append(Tap.cmd_directories) unless path
+    path ||= which("brew-#{cmd}", cmd_paths)
+    path ||= which("brew-#{cmd}.rb", cmd_paths)
+
+    odie "Unknown command: #{cmd}" unless path
+    puts path
   end
 end

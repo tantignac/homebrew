@@ -5,26 +5,17 @@ class Sandbox
   SANDBOX_EXEC = "/usr/bin/sandbox-exec".freeze
 
   def self.available?
-    OS.mac? && File.executable?(SANDBOX_EXEC)
+    OS.mac? && OS::Mac.version >= "10.6" && File.executable?(SANDBOX_EXEC)
   end
 
-  # there are times the sandbox cannot be used.
-  def self.auto_disable?
-    @auto_disable ||= ARGV.interactive? || ARGV.debug?
+  def self.formula?(_formula)
+    return false unless available?
+    !ARGV.no_sandbox?
   end
 
-  def self.print_autodisable_warning
-    unless @printed_autodisable_warning
-      opoo "The sandbox cannot be used in debug or interactive mode."
-      @printed_autodisable_warning = true
-    end
-  end
-
-  def self.print_sandbox_message
-    unless @printed_sandbox_message
-      ohai "Using the sandbox"
-      @printed_sandbox_message = true
-    end
+  def self.test?
+    return false unless available?
+    !ARGV.no_sandbox?
   end
 
   def initialize
@@ -40,25 +31,25 @@ class Sandbox
   end
 
   def allow_write(path, options = {})
-    add_rule :allow => true, :operation => "file-write*", :filter => path_filter(path, options[:type])
+    add_rule allow: true, operation: "file-write*", filter: path_filter(path, options[:type])
   end
 
   def deny_write(path, options = {})
-    add_rule :allow => false, :operation => "file-write*", :filter => path_filter(path, options[:type])
+    add_rule allow: false, operation: "file-write*", filter: path_filter(path, options[:type])
   end
 
   def allow_write_path(path)
-    allow_write path, :type => :subpath
+    allow_write path, type: :subpath
   end
 
   def deny_write_path(path)
-    deny_write path, :type => :subpath
+    deny_write path, type: :subpath
   end
 
   def allow_write_temp_and_cache
     allow_write_path "/private/tmp"
     allow_write_path "/private/var/tmp"
-    allow_write "^/private/var/folders/[^/]+/[^/]+/[C,T]/", :type => :regex
+    allow_write "^/private/var/folders/[^/]+/[^/]+/[C,T]/", type: :regex
     allow_write_path HOMEBREW_TEMP
     allow_write_path HOMEBREW_CACHE
   end
@@ -71,17 +62,21 @@ class Sandbox
 
   # Xcode projects expect access to certain cache/archive dirs.
   def allow_write_xcode
-    allow_write_path "/Users/#{ENV["USER"]}/Library/Developer/Xcode/DerivedData/"
+    allow_write_path "/Users/#{ENV["USER"]}/Library/Developer"
   end
 
   def allow_write_log(formula)
     allow_write_path formula.logs
   end
 
-  def deny_write_homebrew_library
-    deny_write_path HOMEBREW_LIBRARY
-    deny_write_path HOMEBREW_REPOSITORY/".git"
+  def deny_write_homebrew_repository
     deny_write HOMEBREW_BREW_FILE
+    if HOMEBREW_PREFIX.to_s != HOMEBREW_REPOSITORY.to_s
+      deny_write_path HOMEBREW_REPOSITORY
+    else
+      deny_write_path HOMEBREW_LIBRARY
+      deny_write_path HOMEBREW_REPOSITORY/".git"
+    end
   end
 
   def exec(*args)
@@ -107,12 +102,16 @@ class Sandbox
       -k Sender sandboxd
     ]
     logs = Utils.popen_read("syslog", *syslog_args)
+
+    # These messages are confusing and non-fatal, so don't report them.
+    logs = logs.lines.reject { |l| l.match(/^.*Python\(\d+\) deny file-write.*pyc$/) }.join
+
     unless logs.empty?
       if @logfile
-        log = open(@logfile, "w")
-        log.write logs
-        log.write "\nWe use time to filter sandbox log. Therefore, unrelated logs may be recorded.\n"
-        log.close
+        File.open(@logfile, "w") do |log|
+          log.write logs
+          log.write "\nWe use time to filter sandbox log. Therefore, unrelated logs may be recorded.\n"
+        end
       end
 
       if @failed && ARGV.verbose?
@@ -139,7 +138,7 @@ class Sandbox
   end
 
   class SandboxProfile
-    SEATBELT_ERB = <<-EOS.undent
+    SEATBELT_ERB = <<~EOS.freeze
       (version 1)
       (debug deny) ; log all denied operations to /var/log/system.log
       <%= rules.join("\n") %>
@@ -147,6 +146,7 @@ class Sandbox
           (literal "/dev/ptmx")
           (literal "/dev/dtracehelper")
           (literal "/dev/null")
+          (literal "/dev/random")
           (literal "/dev/zero")
           (regex #"^/dev/fd/[0-9]+$")
           (regex #"^/dev/ttys?[0-9]*$")
@@ -167,7 +167,7 @@ class Sandbox
 
     def add_rule(rule)
       s = "("
-      s << (rule[:allow] ? "allow": "deny")
+      s << (rule[:allow] ? "allow" : "deny")
       s << " #{rule[:operation]}"
       s << " (#{rule[:filter]})" if rule[:filter]
       s << " (with #{rule[:modifier]})" if rule[:modifier]

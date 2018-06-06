@@ -1,6 +1,32 @@
+#:  * `fetch` [`--force`] [`--retry`] [`-v`] [`--devel`|`--HEAD`] [`--deps`] [`--build-from-source`|`--force-bottle`] <formulae>:
+#:    Download the source packages for the given <formulae>.
+#:    For tarballs, also print SHA-256 checksums.
+#:
+#:    If `--HEAD` or `--devel` is passed, fetch that version instead of the
+#:    stable version.
+#:
+#:    If `-v` is passed, do a verbose VCS checkout, if the URL represents a VCS.
+#:    This is useful for seeing if an existing VCS cache has been updated.
+#:
+#:    If `--force` (or `-f`) is passed, remove a previously cached version and re-fetch.
+#:
+#:    If `--retry` is passed, retry if a download fails or re-download if the
+#:    checksum of a previously cached version no longer matches.
+#:
+#:    If `--deps` is passed, also download dependencies for any listed <formulae>.
+#:
+#:    If `--build-from-source` (or `-s`) is passed, download the source rather than a
+#:    bottle.
+#:
+#:    If `--force-bottle` is passed, download a bottle if it exists for the
+#:    current or newest version of macOS, even if it would not be used during
+#:    installation.
+
 require "formula"
 
 module Homebrew
+  module_function
+
   def fetch
     raise FormulaUnspecifiedError if ARGV.named.empty?
 
@@ -17,22 +43,40 @@ module Homebrew
 
     puts "Fetching: #{bucket * ", "}" if bucket.size > 1
     bucket.each do |f|
-      f.print_tap_action :verb => "Fetching"
+      f.print_tap_action verb: "Fetching"
 
+      fetched_bottle = false
       if fetch_bottle?(f)
-        fetch_formula(f.bottle)
-      else
-        fetch_formula(f)
-        f.resources.each { |r| fetch_resource(r) }
-        f.patchlist.each { |p| fetch_patch(p) if p.external? }
+        begin
+          fetch_formula(f.bottle)
+        rescue Interrupt
+          raise
+        rescue => e
+          raise if ARGV.homebrew_developer?
+          fetched_bottle = false
+          onoe e.message
+          opoo "Bottle fetch failed: fetching the source."
+        else
+          fetched_bottle = true
+        end
       end
+
+      next if fetched_bottle
+      fetch_formula(f)
+
+      f.resources.each do |r|
+        fetch_resource(r)
+        r.patches.each { |p| fetch_patch(p) if p.external? }
+      end
+
+      f.patchlist.each { |p| fetch_patch(p) if p.external? }
     end
   end
 
   def fetch_bottle?(f)
     return true if ARGV.force_bottle? && f.bottle
     return false unless f.bottle && f.pour_bottle?
-    return false if ARGV.build_from_source? || ARGV.build_bottle?
+    return false if ARGV.build_formula_from_source?(f)
     return false unless f.bottle.compatible_cellar?
     true
   end
@@ -58,8 +102,6 @@ module Homebrew
     Homebrew.failed = true
     opoo "Patch reports different #{e.hash_type}: #{e.expected}"
   end
-
-  private
 
   def retry_fetch?(f)
     @fetch_failed ||= Set.new

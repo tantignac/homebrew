@@ -1,5 +1,5 @@
-require "os/mac"
 require "extend/ENV/shared"
+require "development_tools"
 
 # ### Why `superenv`?
 #
@@ -15,23 +15,17 @@ module Superenv
   include SharedEnvExtension
 
   # @private
-  attr_accessor :keg_only_deps, :deps
-
+  attr_accessor :keg_only_deps, :deps, :run_time_deps
   attr_accessor :x11
-  alias_method :x11?, :x11
 
   def self.extended(base)
     base.keg_only_deps = []
     base.deps = []
+    base.run_time_deps = []
   end
 
   # @private
-  def self.bin
-    return unless MacOS.has_apple_developer_tools?
-
-    bin = (HOMEBREW_REPOSITORY/"Library/ENV").subdirs.reject { |d| d.basename.to_s > MacOS::Xcode.version }.max
-    bin.realpath unless bin.nil?
-  end
+  def self.bin; end
 
   def reset
     super
@@ -45,6 +39,7 @@ module Superenv
     super
     send(compiler)
 
+    self["HOMEBREW_ENV"] = "super"
     self["MAKEFLAGS"] ||= "-j#{determine_make_jobs}"
     self["PATH"] = determine_path
     self["PKG_CONFIG_PATH"] = determine_pkg_config_path
@@ -54,8 +49,8 @@ module Superenv
     self["HOMEBREW_BREW_FILE"] = HOMEBREW_BREW_FILE.to_s
     self["HOMEBREW_PREFIX"] = HOMEBREW_PREFIX.to_s
     self["HOMEBREW_CELLAR"] = HOMEBREW_CELLAR.to_s
+    self["HOMEBREW_OPT"] = "#{HOMEBREW_PREFIX}/opt"
     self["HOMEBREW_TEMP"] = HOMEBREW_TEMP.to_s
-    self["HOMEBREW_SDKROOT"] = effective_sysroot
     self["HOMEBREW_OPTFLAGS"] = determine_optflags
     self["HOMEBREW_ARCHFLAGS"] = ""
     self["CMAKE_PREFIX_PATH"] = determine_cmake_prefix_path
@@ -63,14 +58,12 @@ module Superenv
     self["CMAKE_INCLUDE_PATH"] = determine_cmake_include_path
     self["CMAKE_LIBRARY_PATH"] = determine_cmake_library_path
     self["ACLOCAL_PATH"] = determine_aclocal_path
-    self["M4"] = MacOS.locate("m4") if deps.any? { |d| d.name == "autoconf" }
+    self["M4"] = DevelopmentTools.locate("m4") if deps.any? { |d| d.name == "autoconf" }
     self["HOMEBREW_ISYSTEM_PATHS"] = determine_isystem_paths
     self["HOMEBREW_INCLUDE_PATHS"] = determine_include_paths
     self["HOMEBREW_LIBRARY_PATHS"] = determine_library_paths
-
-    # On 10.9, the tools in /usr/bin proxy to the active developer directory.
-    # This means we can use them for any combination of CLT and Xcode.
-    self["HOMEBREW_PREFER_CLT_PROXIES"] = "1" if MacOS.version >= "10.9"
+    self["HOMEBREW_DEPENDENCIES"] = determine_dependencies
+    self["HOMEBREW_FORMULA_PREFIX"] = formula.prefix unless formula.nil?
 
     # The HOMEBREW_CCCFG ENV variable is used by the ENV/cc tool to control
     # compiler flag stripping. It consists of a string of characters which act
@@ -82,11 +75,13 @@ module Superenv
     # g - Enable "-stdlib=libc++" for clang.
     # h - Enable "-stdlib=libstdc++" for clang.
     # K - Don't strip -arch <arch>, -m32, or -m64
+    # w - Pass -no_weak_imports to the linker
     #
     # On 10.8 and newer, these flags will also be present:
     # s - apply fix for sed's Unicode support
     # a - apply fix for apr-1-config path
   end
+  alias generic_setup_build_environment setup_build_environment
 
   private
 
@@ -98,114 +93,132 @@ module Superenv
     self["HOMEBREW_CXX"] = super
   end
 
-  def effective_sysroot
-    MacOS::Xcode.without_clt? ? MacOS.sdk_path.to_s : nil
-  end
-
   def determine_cxx
     determine_cc.to_s.gsub("gcc", "g++").gsub("clang", "clang++")
   end
 
+  def homebrew_extra_paths
+    []
+  end
+
   def determine_path
-    paths = [Superenv.bin]
+    path = PATH.new(Superenv.bin)
 
     # Formula dependencies can override standard tools.
-    paths += deps.map { |d| d.opt_bin.to_s }
-
-    # On 10.9, there are shims for all tools in /usr/bin.
-    # On 10.7 and 10.8 we need to add these directories ourselves.
-    if MacOS::Xcode.without_clt? && MacOS.version <= "10.8"
-      paths << "#{MacOS::Xcode.prefix}/usr/bin"
-      paths << "#{MacOS::Xcode.toolchain_path}/usr/bin"
-    end
-
-    paths << MacOS::X11.bin.to_s if x11?
-    paths += %w[/usr/bin /bin /usr/sbin /sbin]
+    path.append(deps.map(&:opt_bin))
+    path.append(homebrew_extra_paths)
+    path.append("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
     # Homebrew's apple-gcc42 will be outside the PATH in superenv,
     # so xcrun may not be able to find it
-    case homebrew_cc
-    when "gcc-4.2"
-      begin
-        apple_gcc42 = Formulary.factory("apple-gcc42")
-      rescue FormulaUnavailableError
+    begin
+      case homebrew_cc
+      when "gcc-4.2"
+        path.append(Formulary.factory("apple-gcc42").opt_bin)
+      when GNU_GCC_REGEXP
+        path.append(gcc_version_formula($&).opt_bin)
       end
-      paths << apple_gcc42.opt_bin.to_s if apple_gcc42
-    when GNU_GCC_REGEXP
-      gcc_formula = gcc_version_formula($&)
-      paths << gcc_formula.opt_bin.to_s
+    rescue FormulaUnavailableError
+      # Don't fail and don't add these formulae to the path if they don't exist.
+      nil
     end
 
-    paths.to_path_s
+    path.existing
+  end
+
+  def homebrew_extra_pkg_config_paths
+    []
   end
 
   def determine_pkg_config_path
-    paths  = deps.map { |d| "#{d.opt_lib}/pkgconfig" }
-    paths += deps.map { |d| "#{d.opt_share}/pkgconfig" }
-    paths.to_path_s
+    PATH.new(
+      deps.map { |d| d.opt_lib/"pkgconfig" },
+      deps.map { |d| d.opt_share/"pkgconfig" },
+    ).existing
   end
 
   def determine_pkg_config_libdir
-    paths = %W[/usr/lib/pkgconfig #{HOMEBREW_LIBRARY}/ENV/pkgconfig/#{MacOS.version}]
-    paths << "#{MacOS::X11.lib}/pkgconfig" << "#{MacOS::X11.share}/pkgconfig" if x11?
-    paths.to_path_s
+    PATH.new(
+      homebrew_extra_pkg_config_paths,
+    ).existing
+  end
+
+  def homebrew_extra_aclocal_paths
+    []
   end
 
   def determine_aclocal_path
-    paths = keg_only_deps.map { |d| "#{d.opt_share}/aclocal" }
-    paths << "#{HOMEBREW_PREFIX}/share/aclocal"
-    paths << "#{MacOS::X11.share}/aclocal" if x11?
-    paths.to_path_s
+    PATH.new(
+      keg_only_deps.map { |d| d.opt_share/"aclocal" },
+      HOMEBREW_PREFIX/"share/aclocal",
+      homebrew_extra_aclocal_paths,
+    ).existing
+  end
+
+  def homebrew_extra_isystem_paths
+    []
   end
 
   def determine_isystem_paths
-    paths = []
-    paths << "#{HOMEBREW_PREFIX}/include"
-    paths << "#{effective_sysroot}/usr/include/libxml2" unless deps.any? { |d| d.name == "libxml2" }
-    paths << "#{effective_sysroot}/usr/include/apache2" if MacOS::Xcode.without_clt?
-    paths << MacOS::X11.include.to_s << "#{MacOS::X11.include}/freetype2" if x11?
-    paths << "#{effective_sysroot}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Headers"
-    paths.to_path_s
+    PATH.new(
+      HOMEBREW_PREFIX/"include",
+      homebrew_extra_isystem_paths,
+    ).existing
   end
 
   def determine_include_paths
-    keg_only_deps.map { |d| d.opt_include.to_s }.to_path_s
+    PATH.new(keg_only_deps.map(&:opt_include)).existing
+  end
+
+  def homebrew_extra_library_paths
+    []
   end
 
   def determine_library_paths
-    paths = keg_only_deps.map { |d| d.opt_lib.to_s }
-    paths << "#{HOMEBREW_PREFIX}/lib"
-    paths << MacOS::X11.lib.to_s if x11?
-    paths << "#{effective_sysroot}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Libraries"
-    paths.to_path_s
+    paths = [
+      keg_only_deps.map(&:opt_lib),
+      HOMEBREW_PREFIX/"lib",
+    ]
+    paths += homebrew_extra_library_paths
+    PATH.new(paths).existing
+  end
+
+  def determine_dependencies
+    deps.map(&:name).join(",")
   end
 
   def determine_cmake_prefix_path
-    paths = keg_only_deps.map { |d| d.opt_prefix.to_s }
-    paths << HOMEBREW_PREFIX.to_s
-    paths.to_path_s
+    PATH.new(
+      keg_only_deps.map(&:opt_prefix),
+      HOMEBREW_PREFIX.to_s,
+    ).existing
+  end
+
+  def homebrew_extra_cmake_include_paths
+    []
   end
 
   def determine_cmake_include_path
-    paths = []
-    paths << "#{effective_sysroot}/usr/include/libxml2" unless deps.any? { |d| d.name == "libxml2" }
-    paths << "#{effective_sysroot}/usr/include/apache2" if MacOS::Xcode.without_clt?
-    paths << MacOS::X11.include.to_s << "#{MacOS::X11.include}/freetype2" if x11?
-    paths << "#{effective_sysroot}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Headers"
-    paths.to_path_s
+    PATH.new(homebrew_extra_cmake_include_paths).existing
+  end
+
+  def homebrew_extra_cmake_library_paths
+    []
   end
 
   def determine_cmake_library_path
-    paths = []
-    paths << MacOS::X11.lib.to_s if x11?
-    paths << "#{effective_sysroot}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Libraries"
-    paths.to_path_s
+    PATH.new(homebrew_extra_cmake_library_paths).existing
+  end
+
+  def homebrew_extra_cmake_frameworks_paths
+    []
   end
 
   def determine_cmake_frameworks_path
-    paths = deps.map { |d| d.opt_frameworks.to_s }
-    paths << "#{effective_sysroot}/System/Library/Frameworks" if MacOS::Xcode.without_clt?
-    paths.to_path_s
+    PATH.new(
+      deps.map(&:opt_frameworks),
+      homebrew_extra_cmake_frameworks_paths,
+    ).existing
   end
 
   def determine_make_jobs
@@ -231,12 +244,7 @@ module Superenv
   end
 
   def determine_cccfg
-    s = ""
-    # Fix issue with sed barfing on unicode characters on Mountain Lion
-    s << "s" if MacOS.version >= :mountain_lion
-    # Fix issue with >= 10.8 apr-1-config having broken paths
-    s << "a" if MacOS.version >= :mountain_lion
-    s
+    ""
   end
 
   public
@@ -256,23 +264,24 @@ module Superenv
 
     old
   end
-  alias_method :j1, :deparallelize
 
   def make_jobs
-    self["MAKEFLAGS"] =~ /-\w*j(\d)+/
-    [$1.to_i, 1].max
+    self["MAKEFLAGS"] =~ /-\w*j(\d+)/
+    [Regexp.last_match(1).to_i, 1].max
   end
 
   def universal_binary
+    check_for_compiler_universal_support
+
     self["HOMEBREW_ARCHFLAGS"] = Hardware::CPU.universal_archs.as_arch_flags
 
     # GCC doesn't accept "-march" for a 32-bit CPU with "-arch x86_64"
-    if compiler != :clang && Hardware.is_32_bit?
-      self["HOMEBREW_OPTFLAGS"] = self["HOMEBREW_OPTFLAGS"].sub(
-        /-march=\S*/,
-        "-Xarch_#{Hardware::CPU.arch_32_bit} \\0"
-      )
-    end
+    return if compiler == :clang
+    return unless Hardware::CPU.is_32_bit?
+    self["HOMEBREW_OPTFLAGS"] = self["HOMEBREW_OPTFLAGS"].sub(
+      /-march=\S*/,
+      "-Xarch_#{Hardware::CPU.arch_32_bit} \\0",
+    )
   end
 
   def permit_arch_flags
@@ -288,11 +297,10 @@ module Superenv
   end
 
   def cxx11
-    case homebrew_cc
-    when "clang"
+    if homebrew_cc == "clang"
       append "HOMEBREW_CCCFG", "x", ""
       append "HOMEBREW_CCCFG", "g", ""
-    when /gcc-(4\.(8|9)|5)/
+    elsif gcc_with_cxx11_support?(homebrew_cc)
       append "HOMEBREW_CCCFG", "x", ""
     else
       raise "The selected compiler doesn't support C++11: #{homebrew_cc}"
@@ -318,23 +326,9 @@ module Superenv
     end
   end
 
-  # @private
-  def noop(*_args); end
-  noops = []
+  def set_x11_env_if_installed; end
 
-  # These methods are no longer necessary under superenv, but are needed to
-  # maintain an interface compatible with stdenv.
-  noops.concat %w[fast O4 Og libxml2 set_cpu_flags macosxsdk remove_macosxsdk]
-
-  # These methods provide functionality that has not yet been ported to
-  # superenv.
-  noops.concat %w[gcc_4_0_1 minimal_optimization no_optimization enable_warnings]
-
-  noops.each { |m| alias_method m, :noop }
+  def set_cpu_flags(_, _ = "", _ = {}); end
 end
 
-class Array
-  def to_path_s
-    map(&:to_s).uniq.select { |s| File.directory? s }.join(File::PATH_SEPARATOR).chuzzle
-  end
-end
+require "extend/os/extend/ENV/super"

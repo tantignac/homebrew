@@ -1,12 +1,35 @@
-require "blacklist"
+#:  * `info`:
+#:    Display brief statistics for your Homebrew installation.
+#:
+#:  * `info` <formula>:
+#:    Display information about <formula>.
+#:
+#:  * `info` `--github` <formula>:
+#:    Open a browser to the GitHub History page for <formula>.
+#:
+#:    To view formula history locally: `brew log -p <formula>`
+#:
+#:  * `info` `--json=`<version> (`--all`|`--installed`|<formulae>):
+#:    Print a JSON representation of <formulae>. Currently the only accepted value
+#:    for <version> is `v1`.
+#:
+#:    Pass `--all` to get information on all formulae, or `--installed` to get
+#:    information on all installed formulae.
+#:
+#:    See the docs for examples of using the JSON output:
+#:    <https://docs.brew.sh/Querying-Brew>
+
+require "missing_formula"
 require "caveats"
-require "cmd/options"
+require "options"
 require "formula"
 require "keg"
 require "tab"
-require "utils/json"
+require "json"
 
 module Homebrew
+  module_function
+
   def info
     # eventually we'll solidify an API, but we'll keep old versions
     # awhile around for compatibility
@@ -23,23 +46,22 @@ module Homebrew
     if ARGV.named.empty?
       if HOMEBREW_CELLAR.exist?
         count = Formula.racks.length
-        puts "#{count} keg#{plural(count)}, #{HOMEBREW_CELLAR.abv}"
+        puts "#{Formatter.pluralize(count, "keg")}, #{HOMEBREW_CELLAR.abv}"
       end
     else
       ARGV.named.each_with_index do |f, i|
-        puts unless i == 0
+        puts unless i.zero?
         begin
           if f.include?("/") || File.exist?(f)
             info_formula Formulary.factory(f)
           else
             info_formula Formulary.find_with_priority(f)
           end
-        rescue FormulaUnavailableError
-          # No formula with this name, try a blacklist lookup
-          if (blacklist = blacklisted?(f))
-            puts blacklist
-          else
-            raise
+        rescue FormulaUnavailableError => e
+          ofail e.message
+          # No formula with this name, try a missing formula lookup
+          if (reason = MissingFormula.reason(f))
+            $stderr.puts reason
           end
         end
       end
@@ -48,37 +70,28 @@ module Homebrew
 
   def print_json
     ff = if ARGV.include? "--all"
-      Formula
+      Formula.sort
     elsif ARGV.include? "--installed"
-      Formula.installed
+      Formula.installed.sort
     else
       ARGV.formulae
     end
     json = ff.map(&:to_hash)
-    puts Utils::JSON.dump(json)
+    puts JSON.generate(json)
   end
 
   def github_remote_path(remote, path)
     if remote =~ %r{^(?:https?://|git(?:@|://))github\.com[:/](.+)/(.+?)(?:\.git)?$}
-      "https://github.com/#{$1}/#{$2}/blob/master/#{path}"
+      "https://github.com/#{Regexp.last_match(1)}/#{Regexp.last_match(2)}/blob/master/#{path}"
     else
       "#{remote}/#{path}"
     end
   end
 
   def github_info(f)
-    if f.tap?
-      user, repo = f.tap.split("/", 2)
-      tap = Tap.new user, repo.gsub(/^homebrew-/, "")
-      if remote = tap.remote
-        path = f.path.relative_path_from(tap.path)
-        github_remote_path(remote, path)
-      else
-        f.path
-      end
-    elsif f.core_formula?
-      if remote = git_origin
-        path = f.path.relative_path_from(HOMEBREW_REPOSITORY)
+    if f.tap
+      if remote = f.tap.remote
+        path = f.path.relative_path_from(f.tap.path)
         github_remote_path(remote, path)
       else
         f.path
@@ -105,35 +118,42 @@ module Homebrew
 
     specs << "HEAD" if f.head
 
-    puts "#{f.full_name}: #{specs*", "}#{" (pinned)" if f.pinned?}"
+    attrs = []
+    attrs << "pinned at #{f.pinned_version}" if f.pinned?
+    attrs << "keg-only" if f.keg_only?
 
+    puts "#{f.full_name}: #{specs * ", "}#{" [#{attrs * ", "}]" unless attrs.empty?}"
     puts f.desc if f.desc
+    puts Formatter.url(f.homepage) if f.homepage
 
-    puts f.homepage
-
-    if f.keg_only?
-      puts
-      puts "This formula is keg-only."
-      puts f.keg_only_reason
-      puts
+    conflicts = f.conflicts.map do |c|
+      reason = " (because #{c.reason})" if c.reason
+      "#{c.name}#{reason}"
+    end.sort!
+    unless conflicts.empty?
+      puts <<~EOS
+        Conflicts with:
+          #{conflicts.join("\n  ")}
+      EOS
     end
 
-    conflicts = f.conflicts.map(&:name).sort!
-    puts "Conflicts with: #{conflicts*", "}" unless conflicts.empty?
-
-    if f.rack.directory?
-      kegs = f.rack.subdirs.map { |keg| Keg.new(keg) }.sort_by(&:version)
+    kegs = f.installed_kegs
+    heads, versioned = kegs.partition { |k| k.version.head? }
+    kegs = [
+      *heads.sort_by { |k| -Tab.for_keg(k).time.to_i },
+      *versioned.sort_by(&:version),
+    ]
+    if kegs.empty?
+      puts "Not installed"
+    else
       kegs.each do |keg|
         puts "#{keg} (#{keg.abv})#{" *" if keg.linked?}"
         tab = Tab.for_keg(keg).to_s
         puts "  #{tab}" unless tab.empty?
       end
-    else
-      puts "Not installed"
     end
 
-    history = github_info(f)
-    puts "From: #{history}" if history
+    puts "From: #{Formatter.url(github_info(f))}"
 
     unless f.deps.empty?
       ohai "Dependencies"
@@ -143,35 +163,45 @@ module Homebrew
       end
     end
 
-    unless f.options.empty?
+    unless f.requirements.to_a.empty?
+      ohai "Requirements"
+      %w[build required recommended optional].map do |type|
+        reqs = f.requirements.select(&:"#{type}?")
+        next if reqs.to_a.empty?
+        puts "#{type.capitalize}: #{decorate_requirements(reqs)}"
+      end
+    end
+
+    if !f.options.empty? || f.head || f.devel
       ohai "Options"
       Homebrew.dump_options_for_formula f
     end
 
-    c = Caveats.new(f)
-    ohai "Caveats", c.caveats unless c.empty?
+    caveats = Caveats.new(f)
+    ohai "Caveats", caveats.to_s unless caveats.empty?
   end
 
   def decorate_dependencies(dependencies)
-    # necessary for 1.8.7 unicode handling since many installs are on 1.8.7
-    tick = ["2714".hex].pack("U*")
-    cross = ["2718".hex].pack("U*")
-
     deps_status = dependencies.collect do |dep|
-      if dep.installed?
-        color = Tty.green
-        symbol = tick
+      if dep.satisfied?([])
+        pretty_installed(dep_display_s(dep))
       else
-        color = Tty.red
-        symbol = cross
+        pretty_uninstalled(dep_display_s(dep))
       end
-      if ENV["HOMEBREW_NO_EMOJI"]
-        colored_dep = "#{color}#{dep}"
-      else
-        colored_dep = "#{dep} #{color}#{symbol}"
-      end
-      "#{colored_dep}#{Tty.reset}"
     end
-    deps_status * ", "
+    deps_status.join(", ")
+  end
+
+  def decorate_requirements(requirements)
+    req_status = requirements.collect do |req|
+      req_s = req.display_s
+      req.satisfied? ? pretty_installed(req_s) : pretty_uninstalled(req_s)
+    end
+    req_status.join(", ")
+  end
+
+  def dep_display_s(dep)
+    return dep.name if dep.option_tags.empty?
+    "#{dep.name} #{dep.option_tags.map { |o| "--#{o}" }.join(" ")}"
   end
 end

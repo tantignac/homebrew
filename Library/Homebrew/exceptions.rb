@@ -1,6 +1,28 @@
-class UsageError < RuntimeError; end
-class FormulaUnspecifiedError < UsageError; end
-class KegUnspecifiedError < UsageError; end
+class UsageError < RuntimeError
+  attr_reader :reason
+
+  def initialize(reason = nil)
+    @reason = reason
+  end
+
+  def to_s
+    s = "Invalid usage"
+    s += ": #{reason}" if reason
+    s
+  end
+end
+
+class FormulaUnspecifiedError < UsageError
+  def initialize
+    super "This command requires a formula argument"
+  end
+end
+
+class KegUnspecifiedError < UsageError
+  def initialize
+    super "This command requires a keg argument"
+  end
+end
 
 class MultipleVersionsInstalledError < RuntimeError
   attr_reader :name
@@ -23,15 +45,20 @@ class NoSuchKegError < RuntimeError
 end
 
 class FormulaValidationError < StandardError
-  attr_reader :attr
+  attr_reader :attr, :formula
 
-  def initialize(attr, value)
+  def initialize(formula, attr, value)
     @attr = attr
-    super "invalid attribute: #{attr} (#{value.inspect})"
+    @formula = formula
+    super "invalid attribute for formula '#{formula}': #{attr} (#{value.inspect})"
   end
 end
 
 class FormulaSpecificationError < StandardError; end
+
+class MethodDeprecatedError < StandardError
+  attr_accessor :issues_url
+end
 
 class FormulaUnavailableError < RuntimeError
   attr_reader :name
@@ -46,7 +73,65 @@ class FormulaUnavailableError < RuntimeError
   end
 
   def to_s
-    "No available formula for #{name} #{dependent_s}"
+    "No available formula with the name \"#{name}\" #{dependent_s}"
+  end
+end
+
+module FormulaClassUnavailableErrorModule
+  attr_reader :path
+  attr_reader :class_name
+  attr_reader :class_list
+
+  def to_s
+    s = super
+    s += "\nIn formula file: #{path}"
+    s += "\nExpected to find class #{class_name}, but #{class_list_s}."
+    s
+  end
+
+  private
+
+  def class_list_s
+    formula_class_list = class_list.select { |klass| klass < Formula }
+    if class_list.empty?
+      "found no classes"
+    elsif formula_class_list.empty?
+      "only found: #{format_list(class_list)} (not derived from Formula!)"
+    else
+      "only found: #{format_list(formula_class_list)}"
+    end
+  end
+
+  def format_list(class_list)
+    class_list.map { |klass| klass.name.split("::")[-1] }.join(", ")
+  end
+end
+
+class FormulaClassUnavailableError < FormulaUnavailableError
+  include FormulaClassUnavailableErrorModule
+
+  def initialize(name, path, class_name, class_list)
+    @path = path
+    @class_name = class_name
+    @class_list = class_list
+    super name
+  end
+end
+
+module FormulaUnreadableErrorModule
+  attr_reader :formula_error
+
+  def to_s
+    "#{name}: " + formula_error.to_s
+  end
+end
+
+class FormulaUnreadableError < FormulaUnavailableError
+  include FormulaUnreadableErrorModule
+
+  def initialize(name, error)
+    super(name)
+    @formula_error = error
   end
 end
 
@@ -67,6 +152,28 @@ class TapFormulaUnavailableError < FormulaUnavailableError
   end
 end
 
+class TapFormulaClassUnavailableError < TapFormulaUnavailableError
+  include FormulaClassUnavailableErrorModule
+
+  attr_reader :tap
+
+  def initialize(tap, name, path, class_name, class_list)
+    @path = path
+    @class_name = class_name
+    @class_list = class_list
+    super tap, name
+  end
+end
+
+class TapFormulaUnreadableError < TapFormulaUnavailableError
+  include FormulaUnreadableErrorModule
+
+  def initialize(tap, name, error)
+    super(tap, name)
+    @formula_error = error
+  end
+end
+
 class TapFormulaAmbiguityError < RuntimeError
   attr_reader :name, :paths, :formulae
 
@@ -74,11 +181,10 @@ class TapFormulaAmbiguityError < RuntimeError
     @name = name
     @paths = paths
     @formulae = paths.map do |path|
-      path.to_s =~ HOMEBREW_TAP_PATH_REGEX
-      "#{$1}/#{$2.sub("homebrew-", "")}/#{path.basename(".rb")}"
+      "#{Tap.from_path(path).name}/#{path.basename(".rb")}"
     end
 
-    super <<-EOS.undent
+    super <<~EOS
       Formulae found in multiple taps: #{formulae.map { |f| "\n       * #{f}" }.join}
 
       Please use the fully-qualified name e.g. #{formulae.first} to refer the formula.
@@ -95,10 +201,10 @@ class TapFormulaWithOldnameAmbiguityError < RuntimeError
 
     @taps = possible_tap_newname_formulae.map do |newname|
       newname =~ HOMEBREW_TAP_FORMULA_REGEX
-      "#{$1}/#{$2}"
+      "#{Regexp.last_match(1)}/#{Regexp.last_match(2)}"
     end
 
-    super <<-EOS.undent
+    super <<~EOS
       Formulae with '#{name}' old name found in multiple taps: #{taps.map { |t| "\n       * #{t}" }.join}
 
       Please use the fully-qualified name e.g. #{taps.first}/#{name} to refer the formula or use its new name.
@@ -112,8 +218,49 @@ class TapUnavailableError < RuntimeError
   def initialize(name)
     @name = name
 
-    super <<-EOS.undent
+    super <<~EOS
       No available tap #{name}.
+    EOS
+  end
+end
+
+class TapRemoteMismatchError < RuntimeError
+  attr_reader :name
+  attr_reader :expected_remote
+  attr_reader :actual_remote
+
+  def initialize(name, expected_remote, actual_remote)
+    @name = name
+    @expected_remote = expected_remote
+    @actual_remote = actual_remote
+
+    super <<~EOS
+      Tap #{name} remote mismatch.
+      #{expected_remote} != #{actual_remote}
+    EOS
+  end
+end
+
+class TapAlreadyTappedError < RuntimeError
+  attr_reader :name
+
+  def initialize(name)
+    @name = name
+
+    super <<~EOS
+      Tap #{name} already tapped.
+    EOS
+  end
+end
+
+class TapAlreadyUnshallowError < RuntimeError
+  attr_reader :name
+
+  def initialize(name)
+    @name = name
+
+    super <<~EOS
+      Tap #{name} already a full clone.
     EOS
   end
 end
@@ -131,7 +278,7 @@ end
 
 class OperationInProgressError < RuntimeError
   def initialize(name)
-    message = <<-EOS.undent
+    message = <<~EOS
       Operation already in progress for #{name}
       Another active Homebrew process is already using #{name}.
       Please wait for it to finish or terminate it to continue.
@@ -177,10 +324,10 @@ class FormulaConflictError < RuntimeError
 
   def message
     message = []
-    message << "Cannot install #{formula.full_name} because conflicting formulae are installed.\n"
+    message << "Cannot install #{formula.full_name} because conflicting formulae are installed."
     message.concat conflicts.map { |c| conflict_message(c) } << ""
-    message << <<-EOS.undent
-      Please `brew unlink #{conflicts.map(&:name)*" "}` before continuing.
+    message << <<~EOS
+      Please `brew unlink #{conflicts.map(&:name) * " "}` before continuing.
 
       Unlinking removes a formula's symlinks from #{HOMEBREW_PREFIX}. You can
       link the formula again after the install finishes. You can --force this
@@ -191,8 +338,20 @@ class FormulaConflictError < RuntimeError
   end
 end
 
+class FormulaAmbiguousPythonError < RuntimeError
+  def initialize(formula)
+    super <<~EOS
+      The version of python to use with the virtualenv in the `#{formula.full_name}` formula
+      cannot be guessed automatically. If the simultaneous use of python and python@2
+      is intentional, please add `:using => "python"` or `:using => "python@2"` to
+      `virtualenv_install_with_resources` to resolve the ambiguity manually.
+    EOS
+  end
+end
+
 class BuildError < RuntimeError
   attr_reader :formula, :env
+  attr_accessor :options
 
   def initialize(formula, cmd, args, env)
     @formula = formula
@@ -206,35 +365,24 @@ class BuildError < RuntimeError
   end
 
   def fetch_issues
-    GitHub.issues_for_formula(formula.name)
+    GitHub.issues_for_formula(formula.name, tap: formula.tap)
   rescue GitHub::RateLimitExceededError => e
     opoo e.message
     []
   end
 
   def dump
-    if !ARGV.verbose?
-      puts
-      puts "#{Tty.red}READ THIS#{Tty.reset}: #{Tty.em}#{OS::ISSUES_URL}#{Tty.reset}"
-      if formula.tap?
-        case formula.tap
-        when "homebrew/homebrew-boneyard"
-          puts "#{formula} was moved to homebrew-boneyard because it has unfixable issues."
-          puts "Please do not file any issues about this. Sorry!"
-        else
-          puts "If reporting this issue please do so at (not Homebrew/homebrew):"
-          puts "  https://github.com/#{formula.tap}/issues"
-        end
-      end
-    else
-      require "cmd/config"
-      require "cmd/--env"
+    puts
+
+    if ARGV.verbose?
+      require "system_config"
+      require "build_environment"
 
       ohai "Formula"
       puts "Tap: #{formula.tap}" if formula.tap?
       puts "Path: #{formula.path}"
       ohai "Configuration"
-      Homebrew.dump_verbose_config
+      SystemConfig.dump_verbose_config
       ohai "ENV"
       Homebrew.dump_build_env(env)
       puts
@@ -244,15 +392,41 @@ class BuildError < RuntimeError
         puts logs.map { |fn| "     #{fn}" }.join("\n")
       end
     end
+
+    if formula.tap && defined?(OS::ISSUES_URL)
+      if formula.tap.official?
+        puts Formatter.error(Formatter.url(OS::ISSUES_URL), label: "READ THIS")
+      elsif issues_url = formula.tap.issues_url
+        puts <<~EOS
+          If reporting this issue please do so at (not Homebrew/brew or Homebrew/core):
+          #{Formatter.url(issues_url)}
+        EOS
+      else
+        puts <<~EOS
+          If reporting this issue please do so to (not Homebrew/brew or Homebrew/core):
+          #{formula.tap}
+        EOS
+      end
+    else
+      puts <<~EOS
+        Do not report this issue to Homebrew/brew or Homebrew/core!
+      EOS
+    end
+
     puts
-    if RUBY_VERSION >= "1.8.7" && issues && issues.any?
+
+    unless issues&.empty?
       puts "These open issues may also help:"
       puts issues.map { |i| "#{i["title"]} #{i["html_url"]}" }.join("\n")
     end
 
-    if MacOS.version >= "10.11"
-      require "cmd/doctor"
-      opoo Checks.new.check_for_unsupported_osx
+    require "diagnostic"
+    checks = Homebrew::Diagnostic::Checks.new
+    checks.build_error_checks.each do |check|
+      out = checks.send(check)
+      next if out.nil?
+      puts
+      ofail out
     end
   end
 end
@@ -270,36 +444,11 @@ class BuildToolsError < RuntimeError
       package_text = "a binary package"
     end
 
-    if MacOS.version >= "10.10"
-      xcode_text = <<-EOS.undent
-        To continue, you must install Xcode from the App Store,
-        or the CLT by running:
-          xcode-select --install
-      EOS
-    elsif MacOS.version == "10.9"
-      xcode_text = <<-EOS.undent
-        To continue, you must install Xcode from:
-          https://developer.apple.com/downloads/
-        or the CLT by running:
-          xcode-select --install
-      EOS
-    elsif MacOS.version >= "10.7"
-      xcode_text = <<-EOS.undent
-        To continue, you must install Xcode or the CLT from:
-          https://developer.apple.com/downloads/
-      EOS
-    else
-      xcode_text = <<-EOS.undent
-        To continue, you must install Xcode from:
-          https://developer.apple.com/xcode/downloads/
-      EOS
-    end
-
-    super <<-EOS.undent
+    super <<~EOS
       The following #{formula_text}:
         #{formulae.join(", ")}
-      cannot be installed as a #{package_text} and must be built from source.
-      #{xcode_text}
+      cannot be installed as #{package_text} and must be built from source.
+      #{DevelopmentTools.installation_instructions}
     EOS
   end
 end
@@ -308,7 +457,7 @@ end
 # if the user passes any flags/environment that would case a bottle-only
 # installation on a system without build tools to fail
 class BuildFlagsError < RuntimeError
-  def initialize(flags)
+  def initialize(flags, bottled: true)
     if flags.length > 1
       flag_text = "flags"
       require_text = "require"
@@ -317,37 +466,18 @@ class BuildFlagsError < RuntimeError
       require_text = "requires"
     end
 
-    if MacOS.version >= "10.10"
-      xcode_text = <<-EOS.undent
-        or install Xcode from the App Store, or the CLT by running:
-          xcode-select --install
-      EOS
-    elsif MacOS.version == "10.9"
-      xcode_text = <<-EOS.undent
-        or install Xcode from:
-          https://developer.apple.com/downloads/
-        or the CLT by running:
-          xcode-select --install
-      EOS
-    elsif MacOS.version >= "10.7"
-      xcode_text = <<-EOS.undent
-        or install Xcode or the CLT from:
-          https://developer.apple.com/downloads/
-      EOS
-    else
-      xcode_text = <<-EOS.undent
-        or install Xcode from:
-          https://developer.apple.com/xcode/downloads/
-      EOS
-    end
-
-    super <<-EOS.undent
+    message = <<~EOS.chomp!
       The following #{flag_text}:
         #{flags.join(", ")}
       #{require_text} building tools, but none are installed.
-      Either remove the #{flag_text} to attempt bottle installation,
-      #{xcode_text}
+      #{DevelopmentTools.installation_instructions}
     EOS
+
+    message << <<~EOS.chomp! if bottled
+      Alternatively, remove the #{flag_text} to attempt bottle installation.
+    EOS
+
+    super message
   end
 end
 
@@ -355,18 +485,17 @@ end
 # the compilers available on the user's system
 class CompilerSelectionError < RuntimeError
   def initialize(formula)
-    super <<-EOS.undent
+    super <<~EOS
       #{formula.full_name} cannot be built with any available compilers.
-      To install this formula, you may need to:
-        brew install gcc
-      EOS
+      #{DevelopmentTools.custom_installation_instructions}
+    EOS
   end
 end
 
 # Raised in Resource.fetch
 class DownloadError < RuntimeError
   def initialize(resource, cause)
-    super <<-EOS.undent
+    super <<~EOS
       Failed to download resource #{resource.download_name.inspect}
       #{cause.message}
       EOS
@@ -379,10 +508,17 @@ class CurlDownloadStrategyError < RuntimeError
   def initialize(url)
     case url
     when %r{^file://(.+)}
-      super "File does not exist: #{$1}"
+      super "File does not exist: #{Regexp.last_match(1)}"
     else
       super "Download failed: #{url}"
     end
+  end
+end
+
+# raised in ScpDownloadStrategy.fetch
+class ScpDownloadStrategyError < RuntimeError
+  def initialize(cause)
+    super "Download failed: #{cause}"
   end
 end
 
@@ -405,7 +541,7 @@ class ChecksumMismatchError < RuntimeError
     @expected = expected
     @hash_type = expected.hash_type.to_s.upcase
 
-    super <<-EOS.undent
+    super <<~EOS
       #{@hash_type} mismatch
       Expected: #{expected}
       Actual: #{actual}
@@ -427,12 +563,15 @@ class DuplicateResourceError < ArgumentError
   end
 end
 
-class BottleVersionMismatchError < RuntimeError
-  def initialize(bottle_file, bottle_version, formula, formula_version)
-    super <<-EOS.undent
-      Bottle version mismatch
-      Bottle: #{bottle_file} (#{bottle_version})
-      Formula: #{formula.full_name} (#{formula_version})
+# raised when a single patch file is not found and apply hasn't been specified
+class MissingApplyError < RuntimeError; end
+
+class BottleFormulaUnavailableError < RuntimeError
+  def initialize(bottle_path, formula_path)
+    super <<~EOS
+      This bottle does not contain the formula file:
+        #{bottle_path}
+        #{formula_path}
     EOS
   end
 end

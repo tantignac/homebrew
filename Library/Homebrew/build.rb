@@ -31,9 +31,8 @@ class Build
   def post_superenv_hacks
     # Only allow Homebrew-approved directories into the PATH, unless
     # a formula opts-in to allowing the user's path.
-    if formula.env.userpaths? || reqs.any? { |rq| rq.env.userpaths? }
-      ENV.userpaths!
-    end
+    return unless formula.env.userpaths? || reqs.any? { |rq| rq.env.userpaths? }
+    ENV.userpaths!
   end
 
   def effective_build_options_for(dependent)
@@ -45,12 +44,9 @@ class Build
   def expand_reqs
     formula.recursive_requirements do |dependent, req|
       build = effective_build_options_for(dependent)
-      if (req.optional? || req.recommended?) && build.without?(req)
+      if req.prune_from_option?(build)
         Requirement.prune
-      elsif req.build? && dependent != formula
-        Requirement.prune
-      elsif req.satisfied? && req.default_formula? && (dep = req.to_dependency).installed?
-        deps << dep
+      elsif req.prune_if_build_and_not_dependent?(dependent, formula)
         Requirement.prune
       end
     end
@@ -59,9 +55,9 @@ class Build
   def expand_deps
     formula.recursive_dependencies do |dependent, dep|
       build = effective_build_options_for(dependent)
-      if (dep.optional? || dep.recommended?) && build.without?(dep)
+      if dep.prune_from_option?(build)
         Dependency.prune
-      elsif dep.build? && dependent != formula
+      elsif dep.prune_if_build_and_not_dependent?(dependent, formula)
         Dependency.prune
       elsif dep.build?
         Dependency.keep_but_prune_recursive_deps
@@ -70,9 +66,11 @@ class Build
   end
 
   def install
-    keg_only_deps = deps.map(&:to_formula).select(&:keg_only?)
+    formula_deps = deps.map(&:to_formula)
+    keg_only_deps = formula_deps.select(&:keg_only?)
+    run_time_deps = deps.reject(&:build?).map(&:to_formula)
 
-    deps.map(&:to_formula).each do |dep|
+    formula_deps.each do |dep|
       fixopt(dep) unless dep.opt_prefix.directory?
     end
 
@@ -80,7 +78,8 @@ class Build
 
     if superenv?
       ENV.keg_only_deps = keg_only_deps
-      ENV.deps = deps.map(&:to_formula)
+      ENV.deps = formula_deps
+      ENV.run_time_deps = run_time_deps
       ENV.x11 = reqs.any? { |rq| rq.is_a?(X11Requirement) }
       ENV.setup_build_environment(formula)
       post_superenv_hacks
@@ -102,38 +101,54 @@ class Build
       end
     end
 
-    formula.extend(Debrew::Formula) if ARGV.debug?
+    new_env = {
+      "TMPDIR" => HOMEBREW_TEMP,
+      "TEMP" => HOMEBREW_TEMP,
+      "TMP" => HOMEBREW_TEMP,
+    }
 
-    formula.brew do
-      formula.patch
+    with_env(new_env) do
+      formula.extend(Debrew::Formula) if ARGV.debug?
 
-      if ARGV.git?
-        system "git", "init"
-        system "git", "add", "-A"
-      end
-      if ARGV.interactive?
-        ohai "Entering interactive mode"
-        puts "Type `exit' to return and finalize the installation"
-        puts "Install to this prefix: #{formula.prefix}"
+      formula.brew do |_formula, staging|
+        # For head builds, HOMEBREW_FORMULA_PREFIX should include the commit,
+        # which is not known until after the formula has been staged.
+        ENV["HOMEBREW_FORMULA_PREFIX"] = formula.prefix
+
+        staging.retain! if ARGV.keep_tmp?
+        formula.patch
 
         if ARGV.git?
-          puts "This directory is now a git repo. Make your changes and then use:"
-          puts "  git diff | pbcopy"
-          puts "to copy the diff to the clipboard."
+          system "git", "init"
+          system "git", "add", "-A"
         end
+        if ARGV.interactive?
+          ohai "Entering interactive mode"
+          puts "Type `exit' to return and finalize the installation"
+          puts "Install to this prefix: #{formula.prefix}"
 
-        interactive_shell(formula)
-      else
-        formula.prefix.mkpath
+          if ARGV.git?
+            puts "This directory is now a git repo. Make your changes and then use:"
+            puts "  git diff | pbcopy"
+            puts "to copy the diff to the clipboard."
+          end
 
-        formula.install
+          interactive_shell(formula)
+        else
+          formula.prefix.mkpath
 
-        stdlibs = detect_stdlibs(ENV.compiler)
-        Tab.create(formula, ENV.compiler, stdlibs.first, formula.build).write
+          (formula.logs/"00.options.out").write \
+            "#{formula.full_name} #{formula.build.used_options.sort.join(" ")}".strip
+          formula.install
 
-        # Find and link metafiles
-        formula.prefix.install_metafiles Pathname.pwd
-        formula.prefix.install_metafiles formula.libexec if formula.libexec.exist?
+          stdlibs = detect_stdlibs(ENV.compiler)
+          tab = Tab.create(formula, ENV.compiler, stdlibs.first)
+          tab.write
+
+          # Find and link metafiles
+          formula.prefix.install_metafiles formula.buildpath
+          formula.prefix.install_metafiles formula.libexec if formula.libexec.exist?
+        end
       end
     end
   end
@@ -145,7 +160,7 @@ class Build
     # The stdlib recorded in the install receipt is used during dependency
     # compatibility checks, so we only care about the stdlib that libraries
     # link against.
-    keg.detect_cxx_stdlibs(:skip_executables => true)
+    keg.detect_cxx_stdlibs(skip_executables: true)
   end
 
   def fixopt(f)
@@ -174,7 +189,7 @@ begin
   options = Options.create(ARGV.flags_only)
   build   = Build.new(formula, options)
   build.install
-rescue Exception => e
+rescue Exception => e # rubocop:disable Lint/RescueException
   Marshal.dump(e, error_pipe)
   error_pipe.close
   exit! 1

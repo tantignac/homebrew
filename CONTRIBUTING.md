@@ -1,21 +1,15 @@
 # Contributing to Homebrew
-## Reporting Bugs
-First, please run `brew update` and `brew doctor`.
+First time contributing to Homebrew? Read our [Code of Conduct](https://github.com/Homebrew/brew/blob/master/CODE_OF_CONDUCT.md#code-of-conduct).
 
-Second, read the [Troubleshooting Checklist](https://github.com/Homebrew/homebrew/blob/master/share/doc/homebrew/Troubleshooting.md#troubleshooting).
+### Report a bug
 
-**If you don't read these it will take us far longer to help you with your problem.**
+* Run `brew update` (twice).
+* Run and read `brew doctor`.
+* Read [the Troubleshooting Checklist](https://docs.brew.sh/Troubleshooting).
+* Open an issue on the formula's repository or on Homebrew/brew if it's not a formula-specific issue.
 
-## Security
-Please report security issues to security@brew.sh.
+### Propose a feature
 
-## Contributing
-Please read:
-
-* [Code of Conduct](https://github.com/Homebrew/homebrew/blob/master/CODEOFCONDUCT.md#code-of-conduct)
-* [Formula Cookbook](https://github.com/Homebrew/homebrew/blob/master/share/doc/homebrew/Formula-Cookbook.md#formula-cookbook)
-* [Acceptable Formulae](https://github.com/Homebrew/homebrew/blob/master/share/doc/homebrew/Acceptable-Formulae.md#acceptable-formulae)
-* [Ruby Style Guide](https://github.com/styleguide/ruby)
-* [How To Open a Homebrew Pull Request (and get it merged)](https://github.com/Homebrew/homebrew/blob/master/share/doc/homebrew/How-To-Open-a-Homebrew-Pull-Request-(and-get-it-merged).md#how-to-open-a-homebrew-pull-request-and-get-it-merged)
+* Open an issue with a detailed description of your proposed feature, the motivation for it and alternatives considered. Please note we may close this issue or ask you to create a pull-request if this is not something we see as sufficiently high priority.
 
 Thanks!

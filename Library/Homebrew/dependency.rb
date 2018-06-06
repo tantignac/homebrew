@@ -2,17 +2,20 @@ require "dependable"
 
 # A dependency on another Homebrew formula.
 class Dependency
+  extend Forwardable
   include Dependable
 
-  attr_reader :name, :tags, :env_proc, :option_name
+  attr_reader :name, :tags, :env_proc, :option_names
 
   DEFAULT_ENV_PROC = proc {}
 
-  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_name = name)
+  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_names = [name])
+    raise ArgumentError, "Dependency must have a name!" unless name
+
     @name = name
     @tags = tags
     @env_proc = env_proc
-    @option_name = option_name
+    @option_names = option_names
   end
 
   def to_s
@@ -22,7 +25,7 @@ class Dependency
   def ==(other)
     instance_of?(other.class) && name == other.name && tags == other.tags
   end
-  alias_method :eql?, :==
+  alias eql? ==
 
   def hash
     name.hash ^ tags.hash
@@ -34,21 +37,23 @@ class Dependency
     formula
   end
 
-  def installed?
-    to_formula.installed?
-  end
+  delegate installed?: :to_formula
 
   def satisfied?(inherited_options)
     installed? && missing_options(inherited_options).empty?
   end
 
   def missing_options(inherited_options)
-    required = options | inherited_options
-    required - Tab.for_formula(to_formula).used_options
+    formula = to_formula
+    required = options
+    required |= inherited_options
+    required &= formula.options.to_a
+    required -= Tab.for_formula(formula).used_options
+    required
   end
 
   def modify_build_environment
-    env_proc.call unless env_proc.nil?
+    env_proc&.call
   end
 
   def inspect
@@ -61,7 +66,7 @@ class Dependency
   end
 
   def self._load(marshaled)
-    new(*Marshal.load(marshaled))
+    new(*Marshal.load(marshaled)) # rubocop:disable Security/MarshalLoad
   end
 
   class << self
@@ -71,26 +76,36 @@ class Dependency
     # The default filter, which is applied when a block is not given, omits
     # optionals and recommendeds based on what the dependent has asked for.
     def expand(dependent, deps = dependent.deps, &block)
+      # Keep track dependencies to avoid infinite cyclic dependency recursion.
+      @expand_stack ||= []
+      @expand_stack.push dependent.name
+
       expanded_deps = []
 
       deps.each do |dep|
-        # FIXME: don't hide cyclic dependencies
         next if dependent.name == dep.name
+
+        # we only care about one level of test dependencies.
+        next if dep.test? && @expand_stack.length > 1
 
         case action(dependent, dep, &block)
         when :prune
           next
         when :skip
+          next if @expand_stack.include? dep.name
           expanded_deps.concat(expand(dep.to_formula, &block))
         when :keep_but_prune_recursive_deps
           expanded_deps << dep
         else
+          next if @expand_stack.include? dep.name
           expanded_deps.concat(expand(dep.to_formula, &block))
           expanded_deps << dep
         end
       end
 
       merge_repeats(expanded_deps)
+    ensure
+      @expand_stack.pop
     end
 
     def action(dependent, dep, &_block)
@@ -124,9 +139,35 @@ class Dependency
       all.map(&:name).uniq.map do |name|
         deps = grouped.fetch(name)
         dep  = deps.first
-        tags = deps.flat_map(&:tags).uniq
-        dep.class.new(name, tags, dep.env_proc)
+        tags = merge_tags(deps)
+        option_names = deps.flat_map(&:option_names).uniq
+        dep.class.new(name, tags, dep.env_proc, option_names)
       end
+    end
+
+    private
+
+    def merge_tags(deps)
+      other_tags = deps.flat_map(&:option_tags).uniq
+      other_tags << :test if deps.flat_map(&:tags).include?(:test)
+      merge_necessity(deps) + merge_temporality(deps) + other_tags
+    end
+
+    def merge_necessity(deps)
+      # Cannot use `deps.any?(&:required?)` here due to its definition.
+      if deps.any? { |dep| !dep.recommended? && !dep.optional? }
+        [] # Means required dependency.
+      elsif deps.any?(&:recommended?)
+        [:recommended]
+      else # deps.all?(&:optional?)
+        [:optional]
+      end
+    end
+
+    def merge_temporality(deps)
+      # Means both build and runtime dependency.
+      return [] unless deps.all?(&:build?)
+      [:build]
     end
   end
 end
@@ -134,9 +175,9 @@ end
 class TapDependency < Dependency
   attr_reader :tap
 
-  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_name = name.split("/").last)
-    @tap = name.rpartition("/").first
-    super(name, tags, env_proc, option_name)
+  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_names = [name.split("/").last])
+    @tap = Tap.fetch(name.rpartition("/").first)
+    super(name, tags, env_proc, option_names)
   end
 
   def installed?

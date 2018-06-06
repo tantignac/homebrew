@@ -1,42 +1,35 @@
+#:  * `missing` [`--hide=`<hidden>] [<formulae>]:
+#:    Check the given <formulae> for missing dependencies. If no <formulae> are
+#:    given, check all installed brews.
+#:
+#:    If `--hide=`<hidden> is passed, act as if none of <hidden> are installed.
+#:    <hidden> should be a comma-separated list of formulae.
+#:
+#:    `missing` exits with a non-zero status if any formulae are missing dependencies.
+
 require "formula"
 require "tab"
+require "diagnostic"
 
 module Homebrew
-  def missing_deps(ff)
-    missing = {}
-    ff.each do |f|
-      missing_deps = f.recursive_dependencies do |dependent, dep|
-        if dep.optional? || dep.recommended?
-          tab = Tab.for_formula(dependent)
-          Dependency.prune unless tab.with?(dep)
-        elsif dep.build?
-          Dependency.prune
-        end
-      end
-
-      missing_deps.map!(&:to_formula)
-      missing_deps.reject! { |d| d.rack.exist? && d.rack.subdirs.length > 0 }
-
-      unless missing_deps.empty?
-        yield f.full_name, missing_deps if block_given?
-        missing[f.full_name] = missing_deps
-      end
-    end
-    missing
-  end
+  module_function
 
   def missing
     return unless HOMEBREW_CELLAR.exist?
 
     ff = if ARGV.named.empty?
-      Formula.installed
+      Formula.installed.sort
     else
-      ARGV.resolved_formulae
+      ARGV.resolved_formulae.sort
     end
 
-    missing_deps(ff) do |name, missing|
-      print "#{name}: " if ff.size > 1
-      puts "#{missing * " "}"
+    ff.each do |f|
+      missing = f.missing_dependencies(hide: ARGV.values("hide"))
+      next if missing.empty?
+
+      Homebrew.failed = true
+      print "#{f}: " if ff.size > 1
+      puts missing.join(" ")
     end
   end
 end

@@ -1,25 +1,16 @@
+# Contains backports from newer versions of Ruby
+require_relative "../vendor/backports/string"
+
 class String
-  def undent
-    gsub(/^[ \t]{#{(slice(/^[ \t]+/) || '').length}}/, "")
-  end
-
-  # eg:
-  #   if foo then <<-EOS.undent_________________________________________________________72
-  #               Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do
-  #               eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad
-  #               minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip
-  #               ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
-  #               voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur
-  #               sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt
-  #               mollit anim id est laborum.
-  #               EOS
-  alias_method :undent_________________________________________________________72, :undent
-
   # String.chomp, but if result is empty: returns nil instead.
   # Allows `chuzzle || foo` short-circuits.
   def chuzzle
     s = chomp
     s unless s.empty?
+  end
+
+  def strip_prefix(prefix)
+    start_with?(prefix) ? self[prefix.length..-1] : self
   end
 end
 
@@ -52,12 +43,11 @@ module StringInreplaceExtension
     result
   end
 
-  # Looks for Makefile style variable defintions and replaces the
+  # Looks for Makefile style variable definitions and replaces the
   # value with "new_value", or removes the definition entirely.
   def change_make_var!(flag, new_value)
-    unless gsub!(/^#{Regexp.escape(flag)}[ \t]*=[ \t]*(.*)$/, "#{flag}=#{new_value}", false)
-      errors << "expected to change #{flag.inspect} to #{new_value.inspect}"
-    end
+    return if gsub!(/^#{Regexp.escape(flag)}[ \t]*=[ \t]*(.*)$/, "#{flag}=#{new_value}", false)
+    errors << "expected to change #{flag.inspect} to #{new_value.inspect}"
   end
 
   # Removes variable assignments completely.

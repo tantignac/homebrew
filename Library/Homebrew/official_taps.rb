@@ -1,4 +1,15 @@
-OFFICIAL_TAPS = %w[
+OFFICIAL_CASK_TAPS = %w[
+  cask
+  versions
+].freeze
+
+OFFICIAL_CMD_TAPS = {
+  "homebrew/bundle" => ["bundle"],
+  "homebrew/test-bot" => ["test-bot"],
+  "homebrew/services" => ["services"],
+}.freeze
+
+DEPRECATED_OFFICIAL_TAPS = %w[
   apache
   binary
   completions
@@ -7,6 +18,7 @@ OFFICIAL_TAPS = %w[
   emacs
   fuse
   games
+  gui
   head-only
   nginx
   php
@@ -15,4 +27,4 @@ OFFICIAL_TAPS = %w[
   tex
   versions
   x11
-]
+].freeze

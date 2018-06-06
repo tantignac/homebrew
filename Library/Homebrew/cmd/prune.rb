@@ -1,7 +1,15 @@
+#:  * `prune` [`--dry-run`]:
+#:    Remove dead symlinks from the Homebrew prefix. This is generally not
+#:    needed, but can be useful when doing DIY installations.
+#:
+#:    If `--dry-run` or `-n` is passed, show what would be removed, but do not
+#:    actually remove anything.
+
 require "keg"
-require "cmd/tap"
 
 module Homebrew
+  module_function
+
   def prune
     ObserverPathnameExtension.reset_counts!
 
@@ -23,7 +31,7 @@ module Homebrew
               path.unlink
             end
           end
-        elsif path.directory?
+        elsif path.directory? && !Keg::PRUNEABLE_DIRECTORIES.include?(path)
           dirs << path
         end
       end
@@ -37,15 +45,15 @@ module Homebrew
       end
     end
 
-    migrate_taps :force => true unless ARGV.dry_run?
+    return if ARGV.dry_run?
 
     if ObserverPathnameExtension.total.zero?
       puts "Nothing pruned" if ARGV.verbose?
     else
       n, d = ObserverPathnameExtension.counts
       print "Pruned #{n} symbolic links "
-      print "and #{d} directories " if d > 0
+      print "and #{d} directories " if d.positive?
       puts "from #{HOMEBREW_PREFIX}"
-    end unless ARGV.dry_run?
+    end
   end
 end

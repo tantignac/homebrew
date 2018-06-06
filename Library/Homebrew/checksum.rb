@@ -1,19 +1,18 @@
 class Checksum
-  attr_reader :hash_type, :hexdigest
-  alias_method :to_s, :hexdigest
+  extend Forwardable
 
-  TYPES = [:sha1, :sha256]
+  attr_reader :hash_type, :hexdigest
+
+  TYPES = [:sha256].freeze
 
   def initialize(hash_type, hexdigest)
     @hash_type = hash_type
     @hexdigest = hexdigest
   end
 
-  def empty?
-    hexdigest.empty?
-  end
+  delegate [:empty?, :to_s] => :@hexdigest
 
   def ==(other)
-    hash_type == other.hash_type && hexdigest == other.hexdigest
+    hash_type == other&.hash_type && hexdigest == other.hexdigest
   end
 end

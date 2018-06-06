@@ -1,93 +1,46 @@
-require "pathname"
-require "exceptions"
-require "os/mac"
-require "utils/json"
-require "utils/inreplace"
-require "utils/popen"
+require "emoji"
+require "utils/analytics"
+require "utils/curl"
 require "utils/fork"
+require "utils/formatter"
 require "utils/git"
-require "open-uri"
+require "utils/github"
+require "utils/hash"
+require "utils/inreplace"
+require "utils/link"
+require "utils/popen"
+require "utils/svn"
+require "utils/tty"
+require "time"
 
-class Tty
-  class << self
-    def blue
-      bold 34
-    end
-
-    def white
-      bold 39
-    end
-
-    def red
-      underline 31
-    end
-
-    def yellow
-      underline 33
-    end
-
-    def reset
-      escape 0
-    end
-
-    def em
-      underline 39
-    end
-
-    def green
-      bold 32
-    end
-
-    def gray
-      bold 30
-    end
-
-    def width
-      `/usr/bin/tput cols`.strip.to_i
-    end
-
-    def truncate(str)
-      str.to_s[0, width - 4]
-    end
-
-    private
-
-    def color(n)
-      escape "0;#{n}"
-    end
-
-    def bold(n)
-      escape "1;#{n}"
-    end
-
-    def underline(n)
-      escape "4;#{n}"
-    end
-
-    def escape(n)
-      "\033[#{n}m" if $stdout.tty?
-    end
-  end
+def require?(path)
+  return false if path.nil?
+  require path
+rescue LoadError => e
+  # we should raise on syntax errors but not if the file doesn't exist.
+  raise unless e.message.include?(path)
 end
 
 def ohai(title, *sput)
   title = Tty.truncate(title) if $stdout.tty? && !ARGV.verbose?
-  puts "#{Tty.blue}==>#{Tty.white} #{title}#{Tty.reset}"
+  puts Formatter.headline(title, color: :blue)
   puts sput
 end
 
-def oh1(title)
-  title = Tty.truncate(title) if $stdout.tty? && !ARGV.verbose?
-  puts "#{Tty.green}==>#{Tty.white} #{title}#{Tty.reset}"
+def oh1(title, options = {})
+  if $stdout.tty? && !ARGV.verbose? && options.fetch(:truncate, :auto) == :auto
+    title = Tty.truncate(title)
+  end
+  puts Formatter.headline(title, color: :green)
 end
 
 # Print a warning (do this rarely)
-def opoo(warning)
-  $stderr.puts "#{Tty.yellow}Warning#{Tty.reset}: #{warning}"
+def opoo(message)
+  $stderr.puts Formatter.warning(message, label: "Warning")
 end
 
-def onoe(error)
-  $stderr.puts "#{Tty.red}Error#{Tty.reset}: #{error}"
+def onoe(message)
+  $stderr.puts Formatter.error(message, label: "Error")
 end
 
 def ofail(error)
@@ -100,14 +53,107 @@ def odie(error)
   exit 1
 end
 
-def pretty_duration(s)
-  return "2 seconds" if s < 3 # avoids the plural problem ;)
-  return "#{s.to_i} seconds" if s < 120
-  "%.1f minutes" % (s/60)
+def odeprecated(method, replacement = nil, disable: false, disable_on: nil, caller: send(:caller))
+  replacement_message = if replacement
+    "Use #{replacement} instead."
+  else
+    "There is no replacement."
+  end
+
+  unless disable_on.nil?
+    if disable_on > Time.now
+      will_be_disabled_message = " and will be disabled on #{disable_on.strftime("%Y-%m-%d")}"
+    else
+      disable = true
+    end
+  end
+
+  verb = if disable
+    "disabled"
+  else
+    "deprecated#{will_be_disabled_message}"
+  end
+
+  # Try to show the most relevant location in message, i.e. (if applicable):
+  # - Location in a formula.
+  # - Location outside of 'compat/'.
+  # - Location of caller of deprecated method (if all else fails).
+  backtrace = caller
+  tap_message = nil
+
+  # Don't throw deprecations at all for cached, .brew or .metadata files.
+  return if backtrace.any? do |line|
+    line.include?(HOMEBREW_CACHE) ||
+    line.include?("/.brew/") ||
+    line.include?("/.metadata/")
+  end
+
+  caller_message = backtrace.detect do |line|
+    next unless line =~ %r{^#{Regexp.escape(HOMEBREW_LIBRARY)}/Taps/([^/]+/[^/]+)/}
+    tap = Tap.fetch Regexp.last_match(1)
+    tap_message = "\nPlease report this to the #{tap} tap!"
+    true
+  end
+  caller_message ||= backtrace.detect do |line|
+    !line.start_with?("#{HOMEBREW_LIBRARY_PATH}/compat/")
+  end
+  caller_message ||= backtrace[1]
+
+  message = <<~EOS
+    Calling #{method} is #{verb}!
+    #{replacement_message}
+    #{caller_message}#{tap_message}
+  EOS
+
+  if ARGV.homebrew_developer? || disable ||
+     Homebrew.raise_deprecation_exceptions?
+    if replacement || tap_message
+      message += "Or, even better, submit a PR to fix it!"
+    end
+    raise MethodDeprecatedError, message
+  elsif !Homebrew.auditing?
+    opoo "#{message}\n"
+  end
 end
 
-def plural(n, s = "s")
-  (n == 1) ? "" : s
+def odisabled(method, replacement = nil, options = {})
+  options = { disable: true, caller: caller }.merge(options)
+  odeprecated(method, replacement, options)
+end
+
+def pretty_installed(f)
+  if !$stdout.tty?
+    f.to_s
+  elsif Emoji.enabled?
+    "#{Tty.bold}#{f} #{Formatter.success("✔")}#{Tty.reset}"
+  else
+    Formatter.success("#{Tty.bold}#{f} (installed)#{Tty.reset}")
+  end
+end
+
+def pretty_uninstalled(f)
+  if !$stdout.tty?
+    f.to_s
+  elsif Emoji.enabled?
+    "#{Tty.bold}#{f} #{Formatter.error("✘")}#{Tty.reset}"
+  else
+    Formatter.error("#{Tty.bold}#{f} (uninstalled)#{Tty.reset}")
+  end
+end
+
+def pretty_duration(s)
+  s = s.to_i
+  res = ""
+
+  if s > 59
+    m = s / 60
+    s %= 60
+    res = Formatter.pluralize(m, "minute")
+    return res if s.zero?
+    res << " "
+  end
+
+  res << Formatter.pluralize(s, "second")
 end
 
 def interactive_shell(f = nil)
@@ -117,111 +163,139 @@ def interactive_shell(f = nil)
   end
 
   if ENV["SHELL"].include?("zsh") && ENV["HOME"].start_with?(HOMEBREW_TEMP.resolved_path.to_s)
+    FileUtils.mkdir_p ENV["HOME"]
     FileUtils.touch "#{ENV["HOME"]}/.zshrc"
   end
 
   Process.wait fork { exec ENV["SHELL"] }
 
-  if $?.success?
-    return
-  elsif $?.exited?
-    puts "Aborting due to non-zero exit status"
-    exit $?.exitstatus
-  else
-    raise $?.inspect
-  end
+  return if $CHILD_STATUS.success?
+  raise "Aborted due to non-zero exit status (#{$CHILD_STATUS.exitstatus})" if $CHILD_STATUS.exited?
+  raise $CHILD_STATUS.inspect
 end
 
 module Homebrew
-  def self._system(cmd, *args)
+  module_function
+
+  def _system(cmd, *args, **options)
     pid = fork do
       yield if block_given?
       args.collect!(&:to_s)
-      exec(cmd, *args) rescue nil
+      begin
+        exec(cmd, *args, **options)
+      rescue
+        nil
+      end
       exit! 1 # never gets here unless exec failed
     end
     Process.wait(pid)
-    $?.success?
+    $CHILD_STATUS.success?
   end
 
-  def self.system(cmd, *args)
-    puts "#{cmd} #{args*" "}" if ARGV.verbose?
-    _system(cmd, *args)
+  def system(cmd, *args, **options)
+    puts "#{cmd} #{args * " "}" if ARGV.verbose?
+    _system(cmd, *args, **options)
   end
 
-  def self.git_origin
-    return unless Utils.git_available?
-    HOMEBREW_REPOSITORY.cd { `git config --get remote.origin.url 2>/dev/null`.chuzzle }
+  def install_gem!(name, version = nil)
+    # Match where our bundler gems are.
+    ENV["GEM_HOME"] = "#{ENV["HOMEBREW_LIBRARY"]}/Homebrew/vendor/bundle/ruby/#{RbConfig::CONFIG["ruby_version"]}"
+    ENV["GEM_PATH"] = ENV["GEM_HOME"]
+
+    # Make rubygems notice env changes.
+    Gem.clear_paths
+    Gem::Specification.reset
+
+    # Add Gem binary directory and (if missing) Ruby binary directory to PATH.
+    path = PATH.new(ENV["PATH"])
+    path.prepend(RUBY_BIN) if which("ruby") != RUBY_PATH
+    path.prepend(Gem.bindir)
+    ENV["PATH"] = path
+
+    return unless Gem::Specification.find_all_by_name(name, version).empty?
+
+    ohai "Installing or updating '#{name}' gem"
+    install_args = %W[--no-ri --no-rdoc #{name}]
+    install_args << "--version" << version if version
+
+    # Do `gem install [...]` without having to spawn a separate process or
+    # having to find the right `gem` binary for the running Ruby interpreter.
+    require "rubygems/commands/install_command"
+    install_cmd = Gem::Commands::InstallCommand.new
+    install_cmd.handle_options(install_args)
+    exit_code = 1 # Should not matter as `install_cmd.execute` always throws.
+    begin
+      install_cmd.execute
+    rescue Gem::SystemExitException => e
+      exit_code = e.exit_code
+    end
+    odie "Failed to install/update the '#{name}' gem." if exit_code.nonzero?
   end
 
-  def self.git_head
-    return unless Utils.git_available?
-    HOMEBREW_REPOSITORY.cd { `git rev-parse --verify -q HEAD 2>/dev/null`.chuzzle }
+  def install_gem_setup_path!(name, version = nil, executable = name)
+    install_gem!(name, version)
+
+    return if which(executable)
+    odie <<~EOS
+      The '#{name}' gem is installed but couldn't find '#{executable}' in the PATH:
+      #{ENV["PATH"]}
+    EOS
   end
 
-  def self.git_short_head
-    return unless Utils.git_available?
-    HOMEBREW_REPOSITORY.cd { `git rev-parse --short=4 --verify -q HEAD 2>/dev/null`.chuzzle }
-  end
+  # rubocop:disable Style/GlobalVars
+  def inject_dump_stats!(the_module, pattern)
+    @injected_dump_stat_modules ||= {}
+    @injected_dump_stat_modules[the_module] ||= []
+    injected_methods = @injected_dump_stat_modules[the_module]
+    the_module.module_eval do
+      instance_methods.grep(pattern).each do |name|
+        next if injected_methods.include? name
+        method = instance_method(name)
+        define_method(name) do |*args, &block|
+          begin
+            time = Time.now
+            method.bind(self).call(*args, &block)
+          ensure
+            $times[name] ||= 0
+            $times[name] += Time.now - time
+          end
+        end
+      end
+    end
 
-  def self.git_last_commit
-    return unless Utils.git_available?
-    HOMEBREW_REPOSITORY.cd { `git show -s --format="%cr" HEAD 2>/dev/null`.chuzzle }
-  end
-
-  def self.git_last_commit_date
-    return unless Utils.git_available?
-    HOMEBREW_REPOSITORY.cd { `git show -s --format="%cd" --date=short HEAD 2>/dev/null`.chuzzle }
-  end
-
-  def self.homebrew_version_string
-    if pretty_revision = git_short_head
-      last_commit = git_last_commit_date
-      "#{HOMEBREW_VERSION} (git revision #{pretty_revision}; last commit #{last_commit})"
-    else
-      "#{HOMEBREW_VERSION} (no git repository)"
+    return unless $times.nil?
+    $times = {}
+    at_exit do
+      col_width = [$times.keys.map(&:size).max + 2, 15].max
+      $times.sort_by { |_k, v| v }.each do |method, time|
+        puts format("%-*s %0.4f sec", col_width, "#{method}:", time)
+      end
     end
   end
+  # rubocop:enable Style/GlobalVars
+end
 
-  def self.install_gem_setup_path!(gem, version = nil, executable = gem)
-    require "rubygems"
-    ENV["PATH"] = "#{Gem.user_dir}/bin:#{ENV["PATH"]}"
-
-    args = [gem]
-    args << "-v" << version if version
-
-    unless quiet_system "gem", "list", "--installed", *args
-      safe_system "gem", "install", "--no-ri", "--no-rdoc",
-                                    "--user-install", *args
-    end
-
-    unless which executable
-      odie <<-EOS.undent
-        The '#{gem}' gem is installed but couldn't find '#{executable}' in the PATH:
-        #{ENV["PATH"]}
-      EOS
-    end
+def with_homebrew_path
+  with_env(PATH: PATH.new(ENV["HOMEBREW_PATH"])) do
+    yield
   end
 end
 
-def with_system_path
-  old_path = ENV["PATH"]
-  ENV["PATH"] = "/usr/bin:/bin"
-  yield
-ensure
-  ENV["PATH"] = old_path
+def with_custom_locale(locale)
+  with_env(LC_ALL: locale) do
+    yield
+  end
 end
 
-def run_as_not_developer(&_block)
-  old = ENV.delete "HOMEBREW_DEVELOPER"
-  yield
-ensure
-  ENV["HOMEBREW_DEVELOPER"] = old
+def run_as_not_developer
+  with_env(HOMEBREW_DEVELOPER: nil) do
+    yield
+  end
 end
 
 # Kernel.system but with exceptions
-def safe_system(cmd, *args)
-  Homebrew.system(cmd, *args) || raise(ErrorDuringExecution.new(cmd, args))
+def safe_system(cmd, *args, **options)
+  Homebrew.system(cmd, *args, **options) || raise(ErrorDuringExecution.new(cmd, args))
 end
 
 # prints no output
@@ -234,53 +308,13 @@ def quiet_system(cmd, *args)
   end
 end
 
-def curl(*args)
-  brewed_curl = HOMEBREW_PREFIX/"opt/curl/bin/curl"
-  curl = if MacOS.version <= "10.6" && brewed_curl.exist?
-    brewed_curl
-  else
-    Pathname.new "/usr/bin/curl"
-  end
-  raise "#{curl} is not executable" unless curl.exist? && curl.executable?
-
-  flags = HOMEBREW_CURL_ARGS
-  flags = flags.delete("#") if ARGV.verbose?
-
-  args = [flags, HOMEBREW_USER_AGENT, *args]
-  args << "--verbose" if ENV["HOMEBREW_CURL_VERBOSE"]
-  args << "--silent" unless $stdout.tty?
-
-  safe_system curl, *args
-end
-
-def puts_columns(items, star_items = [])
-  return if items.empty?
-
-  if star_items && star_items.any?
-    items = items.map { |item| star_items.include?(item) ? "#{item}*" : item }
-  end
-
-  if $stdout.tty?
-    # determine the best width to display for different console sizes
-    console_width = `/bin/stty size`.chomp.split(" ").last.to_i
-    console_width = 80 if console_width <= 0
-    max_len = items.reduce(0) { |max, item| l = item.length ; l > max ? l : max }
-    optimal_col_width = (console_width.to_f / (max_len + 2).to_f).floor
-    cols = optimal_col_width > 1 ? optimal_col_width : 1
-
-    IO.popen("/usr/bin/pr -#{cols} -t -w#{console_width}", "w") { |io| io.puts(items) }
-  else
-    puts items
-  end
-end
-
 def which(cmd, path = ENV["PATH"])
-  path.split(File::PATH_SEPARATOR).each do |p|
+  PATH.new(path).each do |p|
     begin
       pcmd = File.expand_path(cmd, p)
     rescue ArgumentError
       # File.expand_path will raise an ArgumentError if the path is malformed.
-      # See https://github.com/Homebrew/homebrew/issues/32789
+      # See https://github.com/Homebrew/legacy-homebrew/issues/32789
       next
     end
     return Pathname.new(pcmd) if File.file?(pcmd) && File.executable?(pcmd)
@@ -288,22 +322,35 @@ def which(cmd, path = ENV["PATH"])
   nil
 end
 
+def which_all(cmd, path = ENV["PATH"])
+  PATH.new(path).map do |p|
+    begin
+      pcmd = File.expand_path(cmd, p)
+    rescue ArgumentError
+      # File.expand_path will raise an ArgumentError if the path is malformed.
+      # See https://github.com/Homebrew/legacy-homebrew/issues/32789
+      next
+    end
+    Pathname.new(pcmd) if File.file?(pcmd) && File.executable?(pcmd)
+  end.compact.uniq
+end
+
 def which_editor
-  editor = ENV.values_at("HOMEBREW_EDITOR", "VISUAL", "EDITOR").compact.first
-  return editor unless editor.nil?
+  editor = ENV.values_at("HOMEBREW_EDITOR", "HOMEBREW_VISUAL")
+              .compact
+              .reject(&:empty?)
+              .first
+  return editor if editor
 
-  # Find Textmate
-  editor = "mate" if which "mate"
-  # Find BBEdit / TextWrangler
-  editor ||= "edit" if which "edit"
-  # Find vim
-  editor ||= "vim" if which "vim"
-  # Default to standard vim
-  editor ||= "/usr/bin/vim"
+  # Find Atom, Sublime Text, Textmate, BBEdit / TextWrangler, or vim
+  editor = %w[atom subl mate edit vim].find do |candidate|
+    candidate if which(candidate, ENV["HOMEBREW_PATH"])
+  end
+  editor ||= "vim"
 
-  opoo <<-EOS.undent
+  opoo <<~EOS
     Using #{editor} because no editor was set in the environment.
-    This may change in the future, so we recommend setting EDITOR, VISUAL,
+    This may change in the future, so we recommend setting EDITOR,
     or HOMEBREW_EDITOR to your preferred text editor.
   EOS
 
@@ -311,11 +358,14 @@ def which_editor
 end
 
 def exec_editor(*args)
-  safe_exec(which_editor, *args)
+  puts "Editing #{args.join "\n"}"
+  with_homebrew_path { safe_exec(which_editor, *args) }
 end
 
 def exec_browser(*args)
-  browser = ENV["HOMEBREW_BROWSER"] || ENV["BROWSER"] || OS::PATH_OPEN
+  browser = ENV["HOMEBREW_BROWSER"]
+  browser ||= OS::PATH_OPEN if defined?(OS::PATH_OPEN)
+  return unless browser
   safe_exec(browser, *args)
 end
 
@@ -328,7 +378,7 @@ end
 # GZips the given paths, and returns the gzipped paths
 def gzip(*paths)
   paths.collect do |path|
-    with_system_path { safe_system "gzip", path }
+    safe_system "gzip", path
     Pathname.new("#{path}.gz")
   end
 end
@@ -348,6 +398,15 @@ ensure
   trap("INT", std_trap)
 end
 
+def capture_stderr
+  old = $stderr
+  $stderr = StringIO.new
+  yield
+  $stderr.string
+ensure
+  $stderr = old
+end
+
 def nostdout
   if ARGV.verbose?
     yield
@@ -364,7 +423,7 @@ def nostdout
 end
 
 def paths
-  @paths ||= ENV["PATH"].split(File::PATH_SEPARATOR).collect do |p|
+  @paths ||= PATH.new(ENV["HOMEBREW_PATH"]).collect do |p|
     begin
       File.expand_path(p).chomp("/")
     rescue ArgumentError
@@ -373,153 +432,149 @@ def paths
   end.uniq.compact
 end
 
-# return the shell profile file based on users' preference shell
-def shell_profile
-  case ENV["SHELL"]
-  when %r{/(ba)?sh} then "~/.bash_profile"
-  when %r{/zsh} then "~/.zshrc"
-  when %r{/ksh} then "~/.kshrc"
-  else "~/.bash_profile"
+def disk_usage_readable(size_in_bytes)
+  if size_in_bytes >= 1_073_741_824
+    size = size_in_bytes.to_f / 1_073_741_824
+    unit = "GB"
+  elsif size_in_bytes >= 1_048_576
+    size = size_in_bytes.to_f / 1_048_576
+    unit = "MB"
+  elsif size_in_bytes >= 1_024
+    size = size_in_bytes.to_f / 1_024
+    unit = "KB"
+  else
+    size = size_in_bytes
+    unit = "B"
+  end
+
+  # avoid trailing zero after decimal point
+  if ((size * 10).to_i % 10).zero?
+    "#{size.to_i}#{unit}"
+  else
+    "#{format("%.1f", size)}#{unit}"
   end
 end
 
-module GitHub
-  extend self
-  ISSUES_URI = URI.parse("https://api.github.com/search/issues")
+def number_readable(number)
+  numstr = number.to_i.to_s
+  (numstr.size - 3).step(1, -3) { |i| numstr.insert(i, ",") }
+  numstr
+end
 
-  Error = Class.new(RuntimeError)
-  HTTPNotFoundError = Class.new(Error)
+# Truncates a text string to fit within a byte size constraint,
+# preserving character encoding validity. The returned string will
+# be not much longer than the specified max_bytes, though the exact
+# shortfall or overrun may vary.
+def truncate_text_to_approximate_size(s, max_bytes, options = {})
+  front_weight = options.fetch(:front_weight, 0.5)
+  if front_weight < 0.0 || front_weight > 1.0
+    raise "opts[:front_weight] must be between 0.0 and 1.0"
+  end
+  return s if s.bytesize <= max_bytes
 
-  class RateLimitExceededError < Error
-    def initialize(reset, error)
-      super <<-EOS.undent
-        GitHub #{error}
-        Try again in #{pretty_ratelimit_reset(reset)}, or create an personal access token:
-          https://github.com/settings/tokens
-        and then set the token as: HOMEBREW_GITHUB_API_TOKEN
-                    EOS
-    end
+  glue = "\n[...snip...]\n"
+  max_bytes_in = [max_bytes - glue.bytesize, 1].max
+  bytes = s.dup.force_encoding("BINARY")
+  glue_bytes = glue.encode("BINARY")
+  n_front_bytes = (max_bytes_in * front_weight).floor
+  n_back_bytes = max_bytes_in - n_front_bytes
+  if n_front_bytes.zero?
+    front = bytes[1..0]
+    back = bytes[-max_bytes_in..-1]
+  elsif n_back_bytes.zero?
+    front = bytes[0..(max_bytes_in - 1)]
+    back = bytes[1..0]
+  else
+    front = bytes[0..(n_front_bytes - 1)]
+    back = bytes[-n_back_bytes..-1]
+  end
+  out = front + glue_bytes + back
+  out.force_encoding("UTF-8")
+  out.encode!("UTF-16", invalid: :replace)
+  out.encode!("UTF-8")
+  out
+end
 
-    def pretty_ratelimit_reset(reset)
-      if (seconds = Time.at(reset) - Time.now) > 180
-        "%d minutes %d seconds" % [seconds / 60, seconds % 60]
-      else
-        "#{seconds} seconds"
+def migrate_legacy_keg_symlinks_if_necessary
+  legacy_linked_kegs = HOMEBREW_LIBRARY/"LinkedKegs"
+  return unless legacy_linked_kegs.directory?
+
+  HOMEBREW_LINKED_KEGS.mkpath unless legacy_linked_kegs.children.empty?
+  legacy_linked_kegs.children.each do |link|
+    name = link.basename.to_s
+    src = begin
+      link.realpath
+    rescue Errno::ENOENT
+      begin
+        (HOMEBREW_PREFIX/"opt/#{name}").realpath
+      rescue Errno::ENOENT
+        begin
+          Formulary.factory(name).installed_prefix
+        rescue
+          next
+        end
       end
     end
+    dst = HOMEBREW_LINKED_KEGS/name
+    dst.unlink if dst.exist?
+    FileUtils.ln_sf(src.relative_path_from(dst.parent), dst)
   end
+  FileUtils.rm_rf legacy_linked_kegs
 
-  class AuthenticationFailedError < Error
-    def initialize(error)
-      super <<-EOS.undent
-        GitHub #{error}
-        HOMEBREW_GITHUB_API_TOKEN may be invalid or expired, check:
-          https://github.com/settings/tokens
-                    EOS
-    end
+  legacy_pinned_kegs = HOMEBREW_LIBRARY/"PinnedKegs"
+  return unless legacy_pinned_kegs.directory?
+
+  HOMEBREW_PINNED_KEGS.mkpath unless legacy_pinned_kegs.children.empty?
+  legacy_pinned_kegs.children.each do |link|
+    name = link.basename.to_s
+    src = link.realpath
+    dst = HOMEBREW_PINNED_KEGS/name
+    FileUtils.ln_sf(src.relative_path_from(dst.parent), dst)
   end
+  FileUtils.rm_rf legacy_pinned_kegs
+end
 
-  def open(url, &_block)
-    # This is a no-op if the user is opting out of using the GitHub API.
-    return if ENV["HOMEBREW_NO_GITHUB_API"]
-
-    require "net/https"
-
-    headers = {
-      "User-Agent" => HOMEBREW_USER_AGENT,
-      "Accept"     => "application/vnd.github.v3+json"
-    }
-
-    headers["Authorization"] = "token #{HOMEBREW_GITHUB_API_TOKEN}" if HOMEBREW_GITHUB_API_TOKEN
-
-    begin
-      Kernel.open(url, headers) { |f| yield Utils::JSON.load(f.read) }
-    rescue OpenURI::HTTPError => e
-      handle_api_error(e)
-    rescue EOFError, SocketError, OpenSSL::SSL::SSLError => e
-      raise Error, "Failed to connect to: #{url}\n#{e.message}", e.backtrace
-    rescue Utils::JSON::Error => e
-      raise Error, "Failed to parse JSON response\n#{e.message}", e.backtrace
-    end
-  end
-
-  def handle_api_error(e)
-    if e.io.meta["x-ratelimit-remaining"].to_i <= 0
-      reset = e.io.meta.fetch("x-ratelimit-reset").to_i
-      error = Utils::JSON.load(e.io.read)["message"]
-      raise RateLimitExceededError.new(reset, error)
+# Calls the given block with the passed environment variables
+# added to ENV, then restores ENV afterwards.
+# Example:
+# with_env(PATH: "/bin") do
+#   system "echo $PATH"
+# end
+#
+# Note that this method is *not* thread-safe - other threads
+# which happen to be scheduled during the block will also
+# see these environment variables.
+def with_env(hash)
+  old_values = {}
+  begin
+    hash.each do |key, value|
+      key = key.to_s
+      old_values[key] = ENV.delete(key)
+      ENV[key] = value
     end
 
-    case e.io.status.first
-    when "401", "403"
-      raise AuthenticationFailedError.new(e.message)
-    when "404"
-      raise HTTPNotFoundError, e.message, e.backtrace
+    yield if block_given?
+  ensure
+    ENV.update(old_values)
+  end
+end
+
+def shell_profile
+  Utils::Shell.profile
+end
+
+def tap_and_name_comparison
+  proc do |a, b|
+    if a.include?("/") && !b.include?("/")
+      1
+    elsif !a.include?("/") && b.include?("/")
+      -1
     else
-      raise Error, e.message, e.backtrace
+      a <=> b
     end
   end
+end
 
-  def issues_matching(query, qualifiers = {})
-    uri = ISSUES_URI.dup
-    uri.query = build_query_string(query, qualifiers)
-    open(uri) { |json| json["items"] }
-  end
-
-  def repository(user, repo)
-    open(URI.parse("https://api.github.com/repos/#{user}/#{repo}")) { |j| j }
-  end
-
-  def build_query_string(query, qualifiers)
-    s = "q=#{uri_escape(query)}+"
-    s << build_search_qualifier_string(qualifiers)
-    s << "&per_page=100"
-  end
-
-  def build_search_qualifier_string(qualifiers)
-    {
-      :repo => "Homebrew/homebrew",
-      :in => "title"
-    }.update(qualifiers).map do |qualifier, value|
-      "#{qualifier}:#{value}"
-    end.join("+")
-  end
-
-  def uri_escape(query)
-    if URI.respond_to?(:encode_www_form_component)
-      URI.encode_www_form_component(query)
-    else
-      require "erb"
-      ERB::Util.url_encode(query)
-    end
-  end
-
-  def issues_for_formula(name)
-    issues_matching(name, :state => "open")
-  end
-
-  def print_pull_requests_matching(query)
-    return [] if ENV["HOMEBREW_NO_GITHUB_API"]
-    ohai "Searching pull requests..."
-
-    open_or_closed_prs = issues_matching(query, :type => "pr")
-
-    open_prs = open_or_closed_prs.select { |i| i["state"] == "open" }
-    if open_prs.any?
-      puts "Open pull requests:"
-      prs = open_prs
-    elsif open_or_closed_prs.any?
-      puts "Closed pull requests:"
-      prs = open_or_closed_prs
-    else
-      return
-    end
-
-    prs.each { |i| puts "#{i["title"]} (#{i["html_url"]})" }
-  end
-
-  def private_repo?(user, repo)
-    uri = URI.parse("https://api.github.com/repos/#{user}/#{repo}")
-    open(uri) { |json| json["private"] }
-  end
+def command_help_lines(path)
+  path.read.lines.grep(/^#:/).map { |line| line.slice(2..-1) }
 end

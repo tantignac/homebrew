@@ -1,76 +1,69 @@
-require "tap"
-require "descriptions"
+#:  * `tap`:
+#:    List all installed taps.
+#:
+#:  * `tap` [`--full`] [`--force-auto-update`] <user>`/`<repo> [<URL>]:
+#:    Tap a formula repository.
+#:
+#:    With <URL> unspecified, taps a formula repository from GitHub using HTTPS.
+#:    Since so many taps are hosted on GitHub, this command is a shortcut for
+#:    `tap <user>/<repo> https://github.com/<user>/homebrew-<repo>`.
+#:
+#:    With <URL> specified, taps a formula repository from anywhere, using
+#:    any transport protocol that `git` handles. The one-argument form of `tap`
+#:    simplifies but also limits. This two-argument command makes no
+#:    assumptions, so taps can be cloned from places other than GitHub and
+#:    using protocols other than HTTPS, e.g., SSH, GIT, HTTP, FTP(S), RSYNC.
+#:
+#:    By default, the repository is cloned as a shallow copy (`--depth=1`), but
+#:    if `--full` is passed, a full clone will be used. To convert a shallow copy
+#:    to a full copy, you can retap passing `--full` without first untapping.
+#:
+#:    By default, only taps hosted on GitHub are auto-updated (for performance
+#:    reasons). If `--force-auto-update` is passed, this tap will be auto-updated
+#:    even if it is not hosted on GitHub.
+#:
+#:    `tap` is re-runnable and exits successfully if there's nothing to do.
+#:    However, retapping with a different <URL> will cause an exception, so first
+#:    `untap` if you need to modify the <URL>.
+#:
+#:  * `tap` `--repair`:
+#:    Migrate tapped formulae from symlink-based to directory-based structure.
+#:
+#:  * `tap` `--list-pinned`:
+#:    List all pinned taps.
 
 module Homebrew
+  module_function
+
   def tap
-    if ARGV.empty?
-      puts Tap.names
-    elsif ARGV.first == "--repair"
-      migrate_taps :force => true
-    elsif ARGV.first == "--list-official"
-      require "official_taps"
-      puts OFFICIAL_TAPS.map { |t| "homebrew/#{t}" }
-    elsif ARGV.first == "--list-pinned"
+    if ARGV.include? "--repair"
+      Tap.each(&:link_completions_and_manpages)
+    elsif ARGV.include? "--list-official"
+      odeprecated("brew tap --list-official")
+    elsif ARGV.include? "--list-pinned"
       puts Tap.select(&:pinned?).map(&:name)
+    elsif ARGV.named.empty?
+      puts Tap.names
     else
-      user, repo = tap_args
-      clone_target = ARGV.named[1]
-      opoo "Already tapped!" unless install_tap(user, repo, clone_target)
-    end
-  end
-
-  def install_tap(user, repo, clone_target = nil)
-    # ensure git is installed
-    Utils.ensure_git_installed!
-
-    tap = Tap.new user, repo
-    return false if tap.installed?
-    ohai "Tapping #{tap}"
-    remote = clone_target || "https://github.com/#{tap.user}/homebrew-#{tap.repo}"
-    args = %W[clone #{remote} #{tap.path}]
-    args << "--depth=1" unless ARGV.include?("--full")
-
-    begin
-      safe_system "git", *args
-    rescue Interrupt, ErrorDuringExecution
-      ignore_interrupts do
-        sleep 0.1 # wait for git to cleanup the top directory when interrupt happens.
-        tap.path.parent.rmdir_if_possible
+      tap = Tap.fetch(ARGV.named[0])
+      begin
+        tap.install clone_target: ARGV.named[1],
+                    force_auto_update: force_auto_update?,
+                    full_clone: full_clone?,
+                    quiet: ARGV.quieter?
+      rescue TapRemoteMismatchError => e
+        odie e
+      rescue TapAlreadyTappedError, TapAlreadyUnshallowError # rubocop:disable Lint/HandleExceptions
       end
-      raise
     end
-
-    formula_count = tap.formula_files.size
-    puts "Tapped #{formula_count} formula#{plural(formula_count, "e")} (#{tap.path.abv})"
-    Descriptions.cache_formulae(tap.formula_names)
-
-    if !clone_target && tap.private?
-      puts <<-EOS.undent
-        It looks like you tapped a private repository. To avoid entering your
-        credentials each time you update, you can use git HTTP credential
-        caching or issue the following command:
-
-          cd #{tap.path}
-          git remote set-url origin git@github.com:#{tap.user}/homebrew-#{tap.repo}.git
-      EOS
-    end
-
-    true
   end
 
-  # Migrate tapped formulae from symlink-based to directory-based structure.
-  def migrate_taps(options = {})
-    ignore = HOMEBREW_LIBRARY/"Formula/.gitignore"
-    return unless ignore.exist? || options.fetch(:force, false)
-    (HOMEBREW_LIBRARY/"Formula").children.each { |c| c.unlink if c.symlink? }
-    ignore.unlink if ignore.exist?
+  def full_clone?
+    ARGV.include?("--full") || ARGV.homebrew_developer?
   end
 
-  private
-
-  def tap_args(tap_name = ARGV.named.first)
-    tap_name =~ HOMEBREW_TAP_ARGS_REGEX
-    raise "Invalid tap name" unless $1 && $3
-    [$1, $3]
+  def force_auto_update?
+    # if no relevant flag is present, return nil, meaning "no change"
+    true if ARGV.include?("--force-auto-update")
   end
 end

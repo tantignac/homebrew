@@ -1,43 +1,80 @@
+#:  * `gist-logs` [`--new-issue`|`-n`] <formula>:
+#:    Upload logs for a failed build of <formula> to a new Gist.
+#:
+#:    <formula> is usually the name of the formula to install, but it can be specified
+#:    in several different ways. See [SPECIFYING FORMULAE](#specifying-formulae).
+#:
+#:    If `--with-hostname` is passed, include the hostname in the Gist.
+#:
+#:    If `--new-issue` is passed, automatically create a new issue in the appropriate
+#:    GitHub repository as well as creating the Gist.
+#:
+#:    If no logs are found, an error message is presented.
+
 require "formula"
-require "cmd/config"
-require "net/http"
-require "net/https"
+require "system_config"
 require "stringio"
+require "socket"
 
 module Homebrew
+  module_function
+
   def gistify_logs(f)
     files = load_logs(f.logs)
+    build_time = f.logs.ctime
+    timestamp = build_time.strftime("%Y-%m-%d_%H-%M-%S")
 
     s = StringIO.new
-    Homebrew.dump_verbose_config(s)
-    files["config.out"] = { :content => s.string }
-    files["doctor.out"] = { :content => `brew doctor 2>&1` }
+    SystemConfig.dump_verbose_config s
+    # Dummy summary file, asciibetically first, to control display title of gist
+    files["# #{f.name} - #{timestamp}.txt"] = { content: brief_build_info(f) }
+    files["00.config.out"] = { content: s.string }
+    files["00.doctor.out"] = { content: Utils.popen_read("#{HOMEBREW_PREFIX}/bin/brew", "doctor", err: :out) }
     unless f.core_formula?
-      tap = <<-EOS.undent
+      tap = <<~EOS
         Formula: #{f.name}
         Tap: #{f.tap}
         Path: #{f.path}
       EOS
-      files["tap.out"] = { :content => tap }
+      files["00.tap.out"] = { content: tap }
     end
 
-    url = create_gist(files)
+    if GitHub.api_credentials_type == :none
+      puts <<~EOS
+        You can create a new personal access token:
+         #{GitHub::ALL_SCOPES_URL}
+        and then set the new HOMEBREW_GITHUB_API_TOKEN as the authentication method.
+
+      EOS
+      login!
+    end
+
+    # Description formatted to work well as page title when viewing gist
+    if f.core_formula?
+      descr = "#{f.name} on #{OS_VERSION} - Homebrew build logs"
+    else
+      descr = "#{f.name} (#{f.full_name}) on #{OS_VERSION} - Homebrew build logs"
+    end
+    url = create_gist(files, descr)
 
     if ARGV.include?("--new-issue") || ARGV.switch?("n")
-      auth = :AUTH_TOKEN
-
-      unless HOMEBREW_GITHUB_API_TOKEN
-        puts "You can create a personal access token: https://github.com/settings/tokens"
-        puts "and then set HOMEBREW_GITHUB_API_TOKEN as authentication method."
-        puts
-
-        auth = :AUTH_BASIC
-      end
-
-      url = new_issue(f.tap, "#{f.name} failed to build on #{MACOS_FULL_VERSION}", url, auth)
+      url = create_issue(f.tap, "#{f.name} failed to build on #{MacOS.full_version}", url)
     end
 
     puts url if url
+  end
+
+  def brief_build_info(f)
+    build_time_str = f.logs.ctime.strftime("%Y-%m-%d %H:%M:%S")
+    s = <<~EOS
+      Homebrew build logs for #{f.full_name} on #{OS_VERSION}
+    EOS
+    if ARGV.include?("--with-hostname")
+      hostname = Socket.gethostname
+      s << "Host: #{hostname}\n"
+    end
+    s << "Build date: #{build_time_str}\n"
+    s
   end
 
   # Hack for ruby < 1.9.3
@@ -49,94 +86,46 @@ module Homebrew
     result
   end
 
-  def login(request)
+  def login!
     print "GitHub User: "
-    user = $stdin.gets.chomp
+    ENV["HOMEBREW_GITHUB_API_USERNAME"] = $stdin.gets.chomp
     print "Password: "
-    password = noecho_gets.chomp
+    ENV["HOMEBREW_GITHUB_API_PASSWORD"] = noecho_gets.chomp
     puts
-    request.basic_auth(user, password)
   end
 
   def load_logs(dir)
     logs = {}
-    dir.children.sort.each do |file|
-      contents = file.size? ? file.read : "empty log"
-      logs[file.basename.to_s] = { :content => contents }
-    end if dir.exist?
+    if dir.exist?
+      dir.children.sort.each do |file|
+        contents = file.size? ? file.read : "empty log"
+        # small enough to avoid GitHub "unicorn" page-load-timeout errors
+        max_file_size = 1_000_000
+        contents = truncate_text_to_approximate_size(contents, max_file_size, front_weight: 0.2)
+        logs[file.basename.to_s] = { content: contents }
+      end
+    end
     raise "No logs." if logs.empty?
     logs
   end
 
-  def create_gist(files)
-    post("/gists", "public" => true, "files" => files)["html_url"]
+  def create_gist(files, description)
+    url = "https://api.github.com/gists"
+    data = { "public" => true, "files" => files, "description" => description }
+    scopes = GitHub::CREATE_GIST_SCOPES
+    GitHub.open_api(url, data: data, scopes: scopes)["html_url"]
   end
 
-  def new_issue(repo, title, body, auth)
-    post("/repos/#{repo}/issues", { "title" => title, "body" => body }, auth)["html_url"]
-  end
-
-  def http
-    @http ||= begin
-      uri = URI.parse("https://api.github.com")
-      p = ENV["http_proxy"] ? URI.parse(ENV["http_proxy"]) : nil
-      if p.class == URI::HTTP || p.class == URI::HTTPS
-        @http = Net::HTTP.new(uri.host, uri.port, p.host, p.port, p.user, p.password)
-      else
-        @http = Net::HTTP.new(uri.host, uri.port)
-      end
-      @http.use_ssl = true
-      @http
-    end
-  end
-
-  def make_request(path, data, auth)
-    headers = {
-      "User-Agent"   => HOMEBREW_USER_AGENT,
-      "Accept"       => "application/vnd.github.v3+json",
-      "Content-Type" => "application/json"
-    }
-
-    if auth == :AUTH_TOKEN || (auth.nil? && HOMEBREW_GITHUB_API_TOKEN)
-      headers["Authorization"] = "token #{HOMEBREW_GITHUB_API_TOKEN}"
-    end
-
-    request = Net::HTTP::Post.new(path, headers)
-
-    login(request) if auth == :AUTH_BASIC
-
-    request.body = Utils::JSON.dump(data)
-    request
-  end
-
-  def post(path, data, auth = nil)
-    request = make_request(path, data, auth)
-
-    case response = http.request(request)
-    when Net::HTTPCreated
-      Utils::JSON.load get_body(response)
-    else
-      raise "HTTP #{response.code} #{response.message} (expected 201)"
-    end
-  end
-
-  def get_body(response)
-    if !response.body.respond_to?(:force_encoding)
-      response.body
-    elsif response["Content-Type"].downcase == "application/json; charset=utf-8"
-      response.body.dup.force_encoding(Encoding::UTF_8)
-    else
-      response.body.encode(Encoding::UTF_8, :undef => :replace)
-    end
+  def create_issue(repo, title, body)
+    url = "https://api.github.com/repos/#{repo}/issues"
+    data = { "title" => title, "body" => body }
+    scopes = GitHub::CREATE_ISSUE_FORK_OR_PR_SCOPES
+    GitHub.open_api(url, data: data, scopes: scopes)["html_url"]
   end
 
   def gist_logs
-    if ARGV.resolved_formulae.length != 1
-      puts "usage: brew gist-logs [--new-issue|-n] <formula>"
-      Homebrew.failed = true
-      return
-    end
+    raise FormulaUnspecifiedError if ARGV.resolved_formulae.length != 1
 
-    gistify_logs(ARGV.resolved_formulae[0])
+    gistify_logs(ARGV.resolved_formulae.first)
   end
 end

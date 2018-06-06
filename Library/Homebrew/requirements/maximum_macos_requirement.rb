@@ -8,11 +8,16 @@ class MaximumMacOSRequirement < Requirement
     super
   end
 
-  satisfy(:build_env => false) { MacOS.version <= @version }
+  satisfy(build_env: false) { MacOS.version <= @version }
 
   def message
-    <<-EOS.undent
-      OS X #{@version.pretty_name} or older is required.
+    <<~EOS
+      This formula either does not compile or function as expected on macOS
+      versions newer than #{@version.pretty_name} due to an upstream incompatibility.
     EOS
+  end
+
+  def display_s
+    "macOS <= #{@version}"
   end
 end

@@ -1,16 +1,22 @@
+#:  * `switch` <formula> <version>:
+#:    Symlink all of the specific <version> of <formula>'s install to Homebrew prefix.
+
 require "formula"
 require "keg"
 require "cmd/link"
 
 module Homebrew
+  module_function
+
   def switch
-    if ARGV.named.length != 2
-      onoe "Usage: brew switch <name> <version>"
+    name = ARGV.first
+
+    usage = "Usage: brew switch <formula> <version>"
+
+    unless name
+      onoe usage
       exit 1
     end
-
-    name = ARGV.shift
-    version = ARGV.shift
 
     rack = Formulary.to_rack(name)
 
@@ -19,13 +25,21 @@ module Homebrew
       exit 2
     end
 
-    # Does the target version exist?
-    unless (rack+version).directory?
+    versions = rack.subdirs
+                   .map { |d| Keg.new(d).version }
+                   .sort
+                   .join(", ")
+    version = ARGV[1]
+
+    if !version || ARGV.named.length > 2
+      onoe usage
+      puts "#{name} installed versions: #{versions}"
+      exit 1
+    end
+
+    unless (rack/version).directory?
       onoe "#{name} does not have a version \"#{version}\" in the Cellar."
-
-      versions = rack.subdirs.map { |d| Keg.new(d).version }
-      puts "Versions available: #{versions.join(", ")}"
-
+      puts "#{name} installed versions: #{versions}"
       exit 3
     end
 
@@ -36,7 +50,7 @@ module Homebrew
       keg.unlink
     end
 
-    keg = Keg.new(rack+version)
+    keg = Keg.new(rack/version)
 
     # Link new version, if not keg-only
     if keg_only?(rack)

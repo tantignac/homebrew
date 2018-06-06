@@ -1,23 +1,28 @@
 module Utils
-  def self.popen_read(*args, &block)
-    popen(args, "rb", &block)
+  def self.popen_read(*args, **options, &block)
+    popen(args, "rb", options, &block)
   end
 
-  def self.popen_write(*args, &block)
-    popen(args, "wb", &block)
+  def self.popen_write(*args, **options, &block)
+    popen(args, "wb", options, &block)
   end
 
-  def self.popen(args, mode)
+  def self.popen(args, mode, options = {})
     IO.popen("-", mode) do |pipe|
       if pipe
-        if block_given?
-          yield pipe
-        else
-          return pipe.read
-        end
+        return pipe.read unless block_given?
+        yield pipe
       else
-        STDERR.reopen("/dev/null", "w")
-        exec(*args)
+        options[:err] ||= :close unless ENV["HOMEBREW_STDERR"]
+        begin
+          exec(*args, options)
+        rescue Errno::ENOENT
+          $stderr.puts "brew: command not found: #{args[0]}" unless options[:err] == :close
+          exit! 127
+        rescue SystemCallError
+          $stderr.puts "brew: exec failed: #{args[0]}" unless options[:err] == :close
+          exit! 1
+        end
       end
     end
   end

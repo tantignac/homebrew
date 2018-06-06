@@ -8,13 +8,13 @@ require "version"
 class Resource
   include FileUtils
 
-  attr_reader :mirrors, :specs, :using
+  attr_reader :mirrors, :specs, :using, :source_modified_time, :patches, :owner
   attr_writer :version
   attr_accessor :download_strategy, :checksum
 
   # Formula name must be set after the DSL, as we have no access to the
   # formula name before initialization of the formula
-  attr_accessor :name, :owner
+  attr_accessor :name
 
   class Download
     def initialize(resource)
@@ -46,7 +46,13 @@ class Resource
     @specs = {}
     @checksum = nil
     @using = nil
+    @patches = []
     instance_eval(&block) if block_given?
+  end
+
+  def owner=(owner)
+    @owner = owner
+    patches.each { |p| p.owner = owner }
   end
 
   def downloader
@@ -72,26 +78,48 @@ class Resource
     downloader.clear_cache
   end
 
+  # Verifies download and unpacks it
+  # The block may call `|resource,staging| staging.retain!` to retain the staging
+  # directory. Subclasses that override stage should implement the tmp
+  # dir using FileUtils.mktemp so that works with all subtypes.
   def stage(target = nil, &block)
     unless target || block
       raise ArgumentError, "target directory or block is required"
     end
 
     verify_download_integrity(fetch)
+    prepare_patches
     unpack(target, &block)
   end
 
-  # If a target is given, unpack there; else unpack to a temp folder
-  # If block is given, yield to that block
-  # A target or a block must be given, but not both
+  def prepare_patches
+    patches.grep(DATAPatch) { |p| p.path = owner.owner.path }
+
+    patches.each do |patch|
+      patch.verify_download_integrity(patch.fetch) if patch.external?
+    end
+  end
+
+  def apply_patches
+    return if patches.empty?
+    ohai "Patching #{name}"
+    patches.each(&:apply)
+  end
+
+  # If a target is given, unpack there; else unpack to a temp folder.
+  # If block is given, yield to that block with |stage|, where stage
+  # is a ResourceStagingContext.
+  # A target or a block must be given, but not both.
   def unpack(target = nil)
-    mktemp(download_name) do
+    mktemp(download_name) do |staging|
       downloader.stage
+      @source_modified_time = downloader.source_modified_time
+      apply_patches
       if block_given?
-        yield self
+        yield ResourceStageContext.new(self, staging)
       elsif target
         target = Pathname.new(target) unless target.is_a? Pathname
-        target.install Dir["*"]
+        target.install Pathname.pwd.children
       end
     end
   end
@@ -138,21 +166,29 @@ class Resource
   end
 
   def version(val = nil)
-    @version ||= detect_version(val)
+    @version ||= begin
+      version = detect_version(val)
+      version.null? ? nil : version
+    end
   end
 
   def mirror(val)
     mirrors << val
   end
 
+  def patch(strip = :p1, src = nil, &block)
+    p = Patch.create(strip, src, &block)
+    patches << p
+  end
+
   private
 
   def detect_version(val)
-    return if val.nil? && url.nil?
+    return Version::NULL if val.nil? && url.nil?
 
     case val
     when nil     then Version.detect(url, specs)
-    when String  then Version.new(val)
+    when String  then Version.create(val)
     when Version then val
     else
       raise TypeError, "version '#{val.inspect}' should be a string"
@@ -163,5 +199,44 @@ class Resource
     def stage(target)
       super(target/name)
     end
+  end
+
+  class PatchResource < Resource
+    attr_reader :patch_files
+
+    def initialize(&block)
+      @patch_files = []
+      super "patch", &block
+    end
+
+    def apply(*paths)
+      paths.flatten!
+      @patch_files.concat(paths)
+      @patch_files.uniq!
+    end
+  end
+end
+
+# The context in which a Resource.stage() occurs. Supports access to both
+# the Resource and associated Mktemp in a single block argument. The interface
+# is back-compatible with Resource itself as used in that context.
+class ResourceStageContext
+  extend Forwardable
+
+  # The Resource that is being staged
+  attr_reader :resource
+  # The Mktemp in which @resource is staged
+  attr_reader :staging
+
+  def_delegators :@resource, :version, :url, :mirrors, :specs, :using, :source_modified_time
+  def_delegators :@staging, :retain!
+
+  def initialize(resource, staging)
+    @resource = resource
+    @staging = staging
+  end
+
+  def to_s
+    "<#{self.class}: resource=#{resource} staging=#{staging}>"
   end
 end

@@ -1,19 +1,26 @@
 module OS
   def self.mac?
-    /darwin/i === RUBY_PLATFORM
+    return false if ENV["HOMEBREW_TEST_GENERIC_OS"]
+    RbConfig::CONFIG["host_os"].include? "darwin"
   end
 
   def self.linux?
-    /linux/i === RUBY_PLATFORM
+    return false if ENV["HOMEBREW_TEST_GENERIC_OS"]
+    RbConfig::CONFIG["host_os"].include? "linux"
   end
 
+  ::OS_VERSION = ENV["HOMEBREW_OS_VERSION"]
+
   if OS.mac?
-    ISSUES_URL = "https://git.io/brew-troubleshooting"
-    PATH_OPEN = "/usr/bin/open"
+    require "os/mac"
+    # Don't tell people to report issues on unsupported versions of macOS.
+    if !OS::Mac.prerelease? && !OS::Mac.outdated_release?
+      ISSUES_URL = "https://docs.brew.sh/Troubleshooting".freeze
+    end
+    PATH_OPEN = "/usr/bin/open".freeze
   elsif OS.linux?
-    ISSUES_URL = "https://github.com/Homebrew/linuxbrew/wiki/troubleshooting"
-    PATH_OPEN = "xdg-open"
-  else
-    raise "Unknown operating system"
+    require "os/linux"
+    ISSUES_URL = "https://github.com/Linuxbrew/brew/wiki/troubleshooting".freeze
+    PATH_OPEN = "xdg-open".freeze
   end
 end

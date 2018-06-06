@@ -1,129 +1,243 @@
 AllCops:
+  TargetRubyVersion: 2.3
   Exclude:
-    - 'Homebrew/vendor/**/*'
-    - 'Homebrew/test/vendor/**/*'
+    - '**/Casks/**/*'
+    - '**/vendor/**/*'
+  DisplayCopNames: false
 
-# 1.8-style hash keys
-Style/HashSyntax:
-    EnforcedStyle: hash_rockets
+require: ./Homebrew/rubocops.rb
 
-# ruby style guide favorite
-Style/StringLiterals:
-    EnforcedStyle: double_quotes
+FormulaAudit:
+  Enabled: true
 
-# consistency with above
-Style/StringLiteralsInInterpolation:
-    EnforcedStyle: double_quotes
+FormulaAuditStrict:
+  Enabled: true
 
-# percent-x is allowed for multiline
-Style/CommandLiteral:
-    EnforcedStyle: mixed
+NewFormulaAudit:
+  Enabled: false
 
-# paths abound, easy escape
-Style/RegexpLiteral:
-    EnforcedStyle: slashes
+# `system` is a special case and aligns on second argument
+Layout/AlignParameters:
+  Enabled: false
 
-# no metrics for formulas
-Metrics/AbcSize:
-    Enabled: false
-Metrics/CyclomaticComplexity:
-    Enabled: false
-Metrics/MethodLength:
-    Enabled: false
-Metrics/ClassLength:
-    Enabled: false
-Metrics/PerceivedComplexity:
-    Enabled: false
+Layout/CaseIndentation:
+  EnforcedStyle: end
 
-# we often need very long lines
-Metrics/LineLength:
-    Enabled: false
+Layout/EmptyLineBetweenDefs:
+  AllowAdjacentOneLineDefs: true
 
-# formulas have no mandatory doc
-Style/Documentation:
-    Enabled: false
+Layout/EndAlignment:
+  EnforcedStyleAlignWith: variable
+
+Layout/IndentArray:
+  EnforcedStyle: special_inside_parentheses
+
+Layout/IndentHeredoc:
+  EnforcedStyle: squiggly
+
+# conflicts with DSL-style path concatenation with `/`
+Layout/SpaceAroundOperators:
+  Enabled: false
 
 # favor parens-less DSL-style arguments
 Lint/AmbiguousOperator:
-    Enabled: false
+  Enabled: false
+
+# so many of these in formulae and can't be autocorrected
 Lint/AmbiguousRegexpLiteral:
-    Enabled: false
+  Enabled: false
+
+# favor parens-less DSL-style arguments
+Lint/AmbiguousBlockAssociation:
+  Enabled: false
+
+# assignment in conditions are useful sometimes
 Lint/AssignmentInCondition:
-    Enabled: false
+  Enabled: false
+
+# so many of these in formulae and can't be autocorrected
 Lint/ParenthesesAsGroupedExpression:
-    Enabled: false
+  Enabled: false
 
-# compact style
-Style/EmptyLineBetweenDefs:
-    AllowAdjacentOneLineDefs: true
+# most metrics don't make sense to apply for formulae/taps
+Metrics/AbcSize:
+  Enabled: false
 
-# port numbers and such tech stuff
+Metrics/BlockLength:
+  Enabled: false
+
+Metrics/ClassLength:
+  Enabled: false
+
+Metrics/CyclomaticComplexity:
+  Enabled: false
+
+Metrics/LineLength:
+  # 124 is the goal as GitHub diff UI wraps beyond that
+  Max: 190
+  # ignore manpage comments and long single-line strings
+  IgnoredPatterns: ['#: ', ' url "', ' mirror "', ' plist_options :']
+
+Metrics/MethodLength:
+  Enabled: false
+
+Metrics/ModuleLength:
+  Enabled: false
+
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+
+Metrics/PerceivedComplexity:
+  Enabled: false
+
+# makes code less readable for minor performance increases
+Performance/Caller:
+  Enabled: false
+
+Style/Alias:
+  EnforcedStyle: prefer_alias
+
+Style/AsciiComments:
+  Enabled: false
+
+Style/AutoResourceCleanup:
+  Enabled: true
+
+Style/BarePercentLiterals:
+  EnforcedStyle: percent_q
+
+Style/BlockDelimiters:
+  EnforcedStyle: line_count_based
+
+Style/ClassAndModuleChildren:
+  EnforcedStyle: nested
+
+# our current conditional style is established, clear and
+# requiring users to change that now would be confusing.
+Style/ConditionalAssignment:
+  Enabled: false
+
+# most of our APIs are internal so don't require docs
+Style/Documentation:
+ Enabled: false
+
+Style/Encoding:
+  Enabled: true
+
+# disabled until we get the Metrics/LineLength down to 80.
+Style/IfUnlessModifier:
+  Enabled: false
+
+# messes with existing plist/caveats style
+Style/TrailingBodyOnMethodDefinition:
+  Enabled: false
+
+# use spaces for indentation; detect tabs
+Layout/Tab:
+  Enabled: true
+
+# We have no use for using `warn` because we are
+# calling Ruby with warnings disabled ourselves.
+Style/StderrPuts:
+  Enabled: false
+
+# dashes in filenames are typical
+Naming/FileName:
+  Regex: !ruby/regexp /^[\w\@\-\+\.]+(\.rb)?$/
+
+# falsely flags e.g. curl formatting arguments as format strings
+Style/FormatStringToken:
+  Enabled: false
+
+# so many of these in formulae and can't be autocorrected
+Style/GuardClause:
+  Enabled: false
+
+# depends_on a: :b looks weird in formulae.
+Style/HashSyntax:
+  EnforcedStyle: hash_rockets
+  Exclude:
+    - '**/bin/**/*'
+    - '**/cmd/**/*'
+    - '**/lib/**/*'
+    - '**/spec/**/*'
+
+# only for numbers >= 1_000_000
 Style/NumericLiterals:
-    Enabled: false
+  MinDigits: 7
+
+# zero-prefixed octal literals are just too widely used (and mostly understood)
+Style/NumericLiteralPrefix:
+  EnforcedOctalStyle: zero_only
 
 # consistency and readability when faced with string interpolation
 Style/PercentLiteralDelimiters:
-    PreferredDelimiters:
-        '%':  '()'
-        '%i': '()'
-        '%q': '()'
-        '%Q': '()'
-        '%r': '{}'
-        '%s': '()'
-        '%w': '[]'
-        '%W': '[]'
-        '%x': '()'
+  PreferredDelimiters:
+    '%':  '()'
+    '%i': '()'
+    '%q': '()'
+    '%Q': '()'
+    '%r': '{}'
+    '%s': '()'
+    '%w': '[]'
+    '%W': '[]'
+    '%x': '()'
 
-# conflicts with DSL-style path concatenation with `/`
-Style/SpaceAroundOperators:
-    Enabled: false
+Style/RaiseArgs:
+  EnforcedStyle: exploded
 
-# not a problem for typical shell users
-Style/SpecialGlobalVars:
-    Enabled: false
+# paths abound, easy escape
+Style/RegexpLiteral:
+  EnforcedStyle: slashes
 
-# `system` is a special case and aligns on second argument
-Style/AlignParameters:
-    Enabled: false
+# ruby style guide favorite
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
 
-# counterproductive in formulas, notably within the install method
-Style/GuardClause:
-    Enabled: false
-Style/IfUnlessModifier:
-    Enabled: false
+# consistency with above
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
 
-# dashes in filenames are typical
-# TODO: enforce when rubocop has fixed this
-# https://github.com/bbatsov/rubocop/issues/1545
-Style/FileName:
-    Enabled: false
+Style/SymbolArray:
+  EnforcedStyle: brackets
 
-# no percent word array, being friendly to non-ruby users
-# TODO: enforce when rubocop has fixed this
-# https://github.com/bbatsov/rubocop/issues/1543
-Style/WordArray:
-    Enabled: false
-Style/UnneededCapitalW:
-    Enabled: false
-
-# we use raise, not fail
-Style/SignalException:
-  EnforcedStyle: only_raise
-
-# we prefer compact if-else-end/case-when-end alignment
-Lint/EndAlignment:
-  AlignWith: variable
-Style/CaseIndentation:
-  IndentWhenRelativeTo: end
-
-# we prefer Perl-style regex back references
-Style/PerlBackrefs:
-  Enabled: false
-
-# this is required for Ruby 1.8
-Style/DotPosition:
-  EnforcedStyle: trailing
+Style/TernaryParentheses:
+  EnforcedStyle: require_parentheses_when_complex
 
 # makes diffs nicer
-Style/TrailingComma:
-  EnforcedStyleForMultiline: consistent_comma
+Style/TrailingCommaInArrayLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/TrailingCommaInArguments:
+  EnforcedStyleForMultiline: comma
+
+# we have too many variables like sha256 where this harms readability
+Naming/VariableNumber:
+  Enabled: false
+
+# doesn't make sense for Homebrew/brew but does for taps
+Naming/UncommunicativeMethodParamName:
+  Enabled: true
+
+Style/WordArray:
+  MinSize: 4
+
+# we want to add this slowly and manually
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+# generally rescuing StandardError is fine
+Style/RescueStandardError:
+  Enabled: false
+
+# implicitly allow EOS as we use it everywhere
+Naming/HeredocDelimiterNaming:
+  Blacklist:
+    - END, EOD, EOF
+
+# we output how to use interpolated strings too often
+Lint/InterpolationCheck:
+  Enabled: false
